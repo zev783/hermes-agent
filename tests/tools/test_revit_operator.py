@@ -24019,6 +24019,287 @@ def test_cli_exposes_agent_ui_flow_execute_approved_candidate_dry_run(tmp_path, 
     assert "APPROVE:" not in stdout
 
 
+def _write_model_open_prompt_choreography(
+    tmp_path,
+    task_id,
+    *,
+    title,
+    text,
+    buttons,
+):
+    journal = TaskJournal(tmp_path, task_id)
+    path = journal.run_dir / "model_open_choreography.json"
+    plan = plan_dialog_response(title=title, text=text, buttons=buttons)
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-model-open-choreography/v1",
+                "status": "stopped_on_prompt",
+                "prompt_events": [
+                    {
+                        "index": 0,
+                        "source": "post_launch_dialog",
+                        "plans": [
+                            {
+                                "dialog_index": 0,
+                                "dialog": {
+                                    "title": title,
+                                    "dialog_text": text,
+                                    "buttons": buttons,
+                                },
+                                "plan": plan,
+                                "requires_human": plan.get("requires_human", True),
+                                "known_dialog_id": plan.get("known_dialog_id"),
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_model_open_prompt_approval_plan_keeps_prompt_tokens_private(tmp_path):
+    choreography_path = _write_model_open_prompt_choreography(
+        tmp_path,
+        "model-open-prompt-approval-source",
+        title="Security - Unsigned Add-in",
+        text="Hermes Revit Operator is unsigned. Do you want to load this add-in?",
+        buttons=["Always Load", "Load Once", "Do Not Load"],
+    )
+
+    journal = TaskJournal(tmp_path, "model-open-prompt-approval-plan-test")
+    result = model_open_choreography.build_model_open_prompt_approval_plan(
+        journal,
+        choreography_path=choreography_path,
+    )
+    public_text = (journal.run_dir / "model_open_prompt_approval_plan.json").read_text(encoding="utf-8")
+    private_text = (journal.run_dir / "model_open_prompt_approval_private_material.json").read_text(encoding="utf-8")
+
+    assert result["success"] is True
+    assert result["approval_required_count"] == 1
+    assert result["manual_or_blocked_count"] == 0
+    assert result["approval_items"][0]["id"] == "model-open-prompt:0:0:unsigned-addin"
+    assert result["approval_items"][0]["target"] == "Always Load"
+    assert "APPROVE:" not in json.dumps(result)
+    assert "APPROVE:" not in public_text
+    assert "APPROVE:" in private_text
+
+
+def test_model_open_prompt_approval_plan_keeps_upgrade_manual(tmp_path):
+    choreography_path = _write_model_open_prompt_choreography(
+        tmp_path,
+        "model-open-prompt-upgrade-source",
+        title="Upgrade model",
+        text="This model must be upgraded.",
+        buttons=["Cancel", "Upgrade"],
+    )
+
+    journal = TaskJournal(tmp_path, "model-open-prompt-upgrade-plan-test")
+    result = model_open_choreography.build_model_open_prompt_approval_plan(
+        journal,
+        choreography_path=choreography_path,
+    )
+    private_text = (journal.run_dir / "model_open_prompt_approval_private_material.json").read_text(encoding="utf-8")
+
+    assert result["success"] is True
+    assert result["approval_required_count"] == 0
+    assert result["manual_or_blocked_count"] == 1
+    assert result["manual_or_blocked_items"][0]["known_dialog_id"] == "upgrade-model"
+    assert "Upgrade" in result["manual_or_blocked_items"][0]["blocked_buttons"]
+    assert "APPROVE:" not in private_text
+
+
+def test_model_open_execute_approved_prompt_dry_run_redacts_tokens(tmp_path):
+    class FakeObserver:
+        def list_dialogs(self):
+            return {
+                "supported": True,
+                "dialogs": [
+                    {
+                        "title": "Security - Unsigned Add-in",
+                        "dialog_text": "Hermes Revit Operator is unsigned. Do you want to load this add-in?",
+                        "buttons": ["Always Load", "Load Once", "Do Not Load"],
+                    }
+                ],
+            }
+
+        def status(self):
+            return {"state": "modal", "active_dialogs": []}
+
+    choreography_path = _write_model_open_prompt_choreography(
+        tmp_path,
+        "model-open-prompt-execute-source",
+        title="Security - Unsigned Add-in",
+        text="Hermes Revit Operator is unsigned. Do you want to load this add-in?",
+        buttons=["Always Load", "Load Once", "Do Not Load"],
+    )
+    approval = model_open_choreography.build_model_open_prompt_approval_plan(
+        TaskJournal(tmp_path, "model-open-prompt-execute-approval"),
+        choreography_path=choreography_path,
+    )
+    journal = TaskJournal(tmp_path, "model-open-prompt-execute-dry-run")
+    result = model_open_choreography.execute_model_open_prompt_approved_step(
+        journal,
+        FakeObserver(),
+        approval_material_path=Path(approval["private_material_path"]),
+        item_id="model-open-prompt:0:0:unsigned-addin",
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "ready_for_approval_execution"
+    assert result["fresh_prompt_match"]["matched"] is True
+    assert result["action_result"]["status"] == "dry_run"
+    assert result["receipt"]["prompt_button_clicked"] is False
+    assert "APPROVE:" not in json.dumps(result)
+    assert "APPROVE:" not in (journal.run_dir / "model_open_prompt_approved_step_result.json").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_model_open_execute_approved_prompt_requires_exact_confirmation(tmp_path, monkeypatch):
+    class FakeObserver:
+        def list_dialogs(self):
+            return {
+                "supported": True,
+                "dialogs": [
+                    {
+                        "title": "Security - Unsigned Add-in",
+                        "dialog_text": "Hermes Revit Operator is unsigned. Do you want to load this add-in?",
+                        "buttons": ["Always Load", "Load Once", "Do Not Load"],
+                    }
+                ],
+            }
+
+        def status(self):
+            return {"state": "modal", "active_dialogs": []}
+
+    choreography_path = _write_model_open_prompt_choreography(
+        tmp_path,
+        "model-open-prompt-confirm-source",
+        title="Security - Unsigned Add-in",
+        text="Hermes Revit Operator is unsigned. Do you want to load this add-in?",
+        buttons=["Always Load", "Load Once", "Do Not Load"],
+    )
+    approval = model_open_choreography.build_model_open_prompt_approval_plan(
+        TaskJournal(tmp_path, "model-open-prompt-confirm-approval"),
+        choreography_path=choreography_path,
+    )
+    calls = []
+
+    class FakeExecutor:
+        def __init__(self, observer, journal):
+            self.observer = observer
+            self.journal = journal
+
+        def run(self, request):
+            calls.append(request)
+            return {
+                "status": "executed",
+                "executed": True,
+                "dry_run": request.dry_run,
+                "policy": {"approval_token": request.approval_token},
+                "authorization": {"allowed": True},
+            }
+
+    monkeypatch.setattr(model_open_choreography, "SafeActionExecutor", FakeExecutor)
+    material_path = Path(approval["private_material_path"])
+
+    wrong = model_open_choreography.execute_model_open_prompt_approved_step(
+        TaskJournal(tmp_path, "model-open-prompt-wrong-confirm"),
+        FakeObserver(),
+        approval_material_path=material_path,
+        item_id="model-open-prompt:0:0:unsigned-addin",
+        execute=True,
+        confirmation="I approve the wrong prompt",
+    )
+    assert wrong["status"] == "stopped_confirmation_required"
+    assert calls == []
+
+    executed = model_open_choreography.execute_model_open_prompt_approved_step(
+        TaskJournal(tmp_path, "model-open-prompt-right-confirm"),
+        FakeObserver(),
+        approval_material_path=material_path,
+        item_id="model-open-prompt:0:0:unsigned-addin",
+        execute=True,
+        confirmation="I approve model-open-prompt:0:0:unsigned-addin",
+    )
+
+    assert executed["status"] == "executed"
+    assert executed["receipt"]["prompt_button_clicked"] is True
+    assert calls[-1].action == "click"
+    assert calls[-1].payload == {"target": "Always Load"}
+    assert calls[-1].approval_token.startswith("APPROVE:")
+    assert "APPROVE:" not in json.dumps(executed)
+
+
+def test_cli_exposes_model_open_prompt_approval_and_execute_dry_run(tmp_path, capsys, monkeypatch):
+    class FakeObserver:
+        def list_dialogs(self):
+            return {
+                "supported": True,
+                "dialogs": [
+                    {
+                        "title": "Security - Unsigned Add-in",
+                        "dialog_text": "Hermes Revit Operator is unsigned. Do you want to load this add-in?",
+                        "buttons": ["Always Load", "Load Once", "Do Not Load"],
+                    }
+                ],
+            }
+
+        def status(self):
+            return {"state": "modal", "active_dialogs": []}
+
+    monkeypatch.setattr(cli, "RevitWindowObserver", lambda: FakeObserver())
+    choreography_path = _write_model_open_prompt_choreography(
+        tmp_path,
+        "model-open-prompt-cli-source",
+        title="Security - Unsigned Add-in",
+        text="Hermes Revit Operator is unsigned. Do you want to load this add-in?",
+        buttons=["Always Load", "Load Once", "Do Not Load"],
+    )
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "model-open-prompt-approval-cli-test",
+            "agent-model-open-prompt-approval-plan",
+            "--choreography",
+            str(choreography_path),
+        ]
+    )
+    assert code == 0
+    approval_stdout = capsys.readouterr().out
+    approval = json.loads(approval_stdout)
+    assert approval["approval_required_count"] == 1
+    assert "APPROVE:" not in approval_stdout
+
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "model-open-prompt-execute-cli-test",
+            "agent-model-open-execute-approved-prompt",
+            "--approval-material",
+            approval["private_material_path"],
+            "--item-id",
+            "model-open-prompt:0:0:unsigned-addin",
+        ]
+    )
+    assert code == 0
+    execute_stdout = capsys.readouterr().out
+    output = json.loads(execute_stdout)
+    assert output["status"] == "ready_for_approval_execution"
+    assert output["action_result"]["status"] == "dry_run"
+    assert "APPROVE:" not in execute_stdout
+
+
 def test_model_open_choreography_dry_run_redacts_open_approval(tmp_path):
     class FakeObserver:
         def status(self):

@@ -54,7 +54,11 @@ from .dialog_workflows import (
 )
 from .execution_audit import audit_ui_execution_coverage
 from .journal import TaskJournal
-from .model_open_choreography import run_model_open_choreography
+from .model_open_choreography import (
+    build_model_open_prompt_approval_plan,
+    execute_model_open_prompt_approved_step,
+    run_model_open_choreography,
+)
 from .navigation import find_views
 from .north_star import (
     build_north_star_blocked_ledger,
@@ -833,6 +837,22 @@ def build_parser() -> argparse.ArgumentParser:
     open_choreography.add_argument("--poll", type=float, default=2.0)
     open_choreography.add_argument("--max-prompt-checks", type=int, default=12)
 
+    open_prompt_approval = sub.add_parser(
+        "agent-model-open-prompt-approval-plan",
+        help="Create approval material from model-open/startup prompt choreography without clicking.",
+    )
+    open_prompt_approval.add_argument("--choreography", required=True)
+    open_prompt_approval.add_argument("--limit", type=int, default=10)
+
+    open_prompt_execute = sub.add_parser(
+        "agent-model-open-execute-approved-prompt",
+        help="Dry-run or execute one item from private model-open prompt approval material.",
+    )
+    open_prompt_execute.add_argument("--approval-material", required=True)
+    open_prompt_execute.add_argument("--item-id", required=True)
+    open_prompt_execute.add_argument("--execute", action="store_true")
+    open_prompt_execute.add_argument("--confirmation", default="")
+
     operation = sub.add_parser("request-operation", help="Queue an in-Revit add-in operation.")
     _add_action_flags(operation)
     operation.add_argument(
@@ -1161,6 +1181,8 @@ _STDOUT_REDACTED_APPROVAL_COMMANDS = {
     "agent-ui-flow-approval-plan",
     "agent-ui-flow-execute-approved-candidate",
     "agent-model-open-choreography",
+    "agent-model-open-prompt-approval-plan",
+    "agent-model-open-execute-approved-prompt",
     "agent-session-approval-plan",
     "agent-session-execute-approved-item",
 }
@@ -2073,6 +2095,27 @@ def dispatch(args: argparse.Namespace) -> dict:
                 timeout=args.timeout,
                 poll=args.poll,
                 max_prompt_checks=args.max_prompt_checks,
+            ),
+            "journal": journal.describe(),
+        }
+    elif command == "agent-model-open-prompt-approval-plan":
+        return {
+            **build_model_open_prompt_approval_plan(
+                journal,
+                choreography_path=Path(args.choreography),
+                limit=args.limit,
+            ),
+            "journal": journal.describe(),
+        }
+    elif command == "agent-model-open-execute-approved-prompt":
+        return {
+            **execute_model_open_prompt_approved_step(
+                journal,
+                observer,
+                approval_material_path=Path(args.approval_material),
+                item_id=args.item_id,
+                execute=args.execute,
+                confirmation=args.confirmation,
             ),
             "journal": journal.describe(),
         }

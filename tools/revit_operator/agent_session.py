@@ -2030,9 +2030,13 @@ def _model_open_commands(model_path: str, expected_revit_version: str, expected_
         if expected_title_contains:
             choreography_args.extend(["--expected-title-contains", expected_title_contains])
         commands.append(_command(choreography_args))
+        commands.append(
+            _command(["agent-model-open-prompt-approval-plan", "--choreography", "<model_open_choreography.json>"])
+        )
     else:
         commands.append("open-model --model <copied-local-model>")
         commands.append("agent-model-open-choreography --model <copied-local-model>")
+        commands.append("agent-model-open-prompt-approval-plan --choreography <model_open_choreography.json>")
     commands.extend(
         [
             "wait-for-dialog --timeout 5",

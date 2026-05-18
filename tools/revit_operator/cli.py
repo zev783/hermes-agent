@@ -13,6 +13,7 @@ from .actions import ActionRequest, SafeActionExecutor, validate_action_approval
 from .agent_session import (
     build_agent_session_approval_plan,
     build_agent_session_completion_audit,
+    build_agent_session_real_gate_ledger,
     build_ui_flow_candidate_approval_plan,
     execute_agent_session_approved_item,
     execute_ui_flow_approved_candidate,
@@ -1017,6 +1018,24 @@ def build_parser() -> argparse.ArgumentParser:
     agent_session_completion.add_argument("--max-artifacts", type=int, default=500)
     agent_session_completion.add_argument("--target-hours", type=float, default=4.0)
 
+    agent_session_gate_ledger = sub.add_parser(
+        "agent-session-real-gate-ledger",
+        help="Write a read-only ledger of the real approval/time/prompt gates still blocking completion.",
+    )
+    agent_session_gate_ledger.add_argument(
+        "--objective",
+        default="",
+        help="Plain-English Revit agent objective; defaults to the current broad agent objective.",
+    )
+    agent_session_gate_ledger.add_argument("--artifact-root", default="")
+    agent_session_gate_ledger.add_argument("--max-artifacts", type=int, default=500)
+    agent_session_gate_ledger.add_argument("--target-hours", type=float, default=4.0)
+    agent_session_gate_ledger.add_argument(
+        "--no-refresh-supervision-status",
+        action="store_true",
+        help="Do not write a fresh supervision status artifact before the ledger.",
+    )
+
     agent_session_refresh = sub.add_parser(
         "agent-session-evidence-refresh",
         help="Run all read-only evidence collectors for the broad Revit-agent goal and write a fresh completion audit.",
@@ -1236,6 +1255,7 @@ _STDOUT_REDACTED_APPROVAL_COMMANDS = {
     "agent-session-checkpoint",
     "agent-session-resume-plan",
     "agent-session-completion-audit",
+    "agent-session-real-gate-ledger",
     "agent-session-evidence-refresh",
     "agent-ui-flow-scout",
     "agent-ui-flow-approval-plan",
@@ -2372,6 +2392,18 @@ def dispatch(args: argparse.Namespace) -> dict:
                 artifact_root=Path(args.artifact_root) if args.artifact_root else None,
                 max_artifacts=args.max_artifacts,
                 target_hours=args.target_hours,
+            ),
+            "journal": journal.describe(),
+        }
+    elif command == "agent-session-real-gate-ledger":
+        return {
+            **build_agent_session_real_gate_ledger(
+                journal,
+                objective=args.objective,
+                artifact_root=Path(args.artifact_root) if args.artifact_root else None,
+                max_artifacts=args.max_artifacts,
+                target_hours=args.target_hours,
+                refresh_supervision_status=not args.no_refresh_supervision_status,
             ),
             "journal": journal.describe(),
         }

@@ -1918,6 +1918,7 @@ def test_process_and_wait_observation_actions_are_allowed():
     assert classify_action("supervision-endurance-matrix").decision == "allow"
     assert classify_action("supervision-endurance-audit").decision == "allow"
     assert classify_action("agent-session-supervision-status").decision == "allow"
+    assert classify_action("agent-session-real-gate-ledger").decision == "allow"
     assert classify_action("recovery-drill-matrix").decision == "allow"
     assert classify_action("workflow-approval-plan").decision == "allow"
     assert classify_action(
@@ -23425,6 +23426,69 @@ def test_agent_session_completion_audit_reports_readiness_evidence_without_compl
     assert result["may_call_update_goal"] is False
 
 
+def test_agent_session_real_gate_ledger_summarizes_readiness_without_execution(tmp_path):
+    run_dir = tmp_path / "revit_operator_runs" / "readiness-evidence"
+    run_dir.mkdir(parents=True)
+    (run_dir / "agent_ui_flow_approved_candidate_result.json").write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-agent-ui-flow-approved-candidate/v1",
+                "success": True,
+                "status": "ready_for_approval_execution",
+                "item_id": "ui-candidate:7:worksets",
+                "execute_requested": False,
+                "receipt": {
+                    "ui_action_executed": False,
+                    "model_write_performed": False,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "agent_session_approved_item_result.json").write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-agent-session-approved-item/v1",
+                "success": True,
+                "status": "ready_for_approval_execution",
+                "item_id": "model-change:reload-links",
+                "item_kind": "model-change-operation",
+                "execute_requested": False,
+                "execution": {
+                    "operation": "reload-links",
+                    "executed": False,
+                    "receipt": {
+                        "queued_operation": "reload-links",
+                        "model_write_guard": True,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = agent_session.build_agent_session_real_gate_ledger(
+        TaskJournal(tmp_path, "agent-session-real-gate-ledger-test"),
+        objective="have revit autonomously handle arbitrary ui flows and approved model-changing work",
+        refresh_supervision_status=False,
+    )
+
+    assert result["success"] is True
+    assert result["read_only"] is True
+    assert result["status"] == "waiting_on_human_or_real_conditions"
+    assert result["goal_complete"] is False
+    assert result["may_call_update_goal"] is False
+    assert result["execution_guard"]["may_execute_from_this_result"] is False
+    assert result["execution_guard"]["approval_tokens_included"] is False
+    assert result["execution_guard"]["approval_phrases_included"] is False
+    assert result["gate_summary"]["ready_for_human_or_real_condition"] >= 2
+    assert any(gate["id"] == "arbitrary-ui-live-execution" for gate in result["real_gates"])
+    assert all(action["read_only"] for action in result["next_read_only_actions"])
+    assert all("--execute" not in action["command"] for action in result["next_read_only_actions"])
+    assert "APPROVE:" not in json.dumps(result)
+    assert (TaskJournal(tmp_path, "agent-session-real-gate-ledger-test").run_dir / "agent_session_real_gate_ledger.json").exists()
+
+
 def test_cli_exposes_agent_session_completion_audit_with_redacted_stdout(tmp_path, capsys):
     run_dir = tmp_path / "revit_operator_runs" / "cli-evidence"
     run_dir.mkdir(parents=True)
@@ -23457,6 +23521,43 @@ def test_cli_exposes_agent_session_completion_audit_with_redacted_stdout(tmp_pat
     assert output["success"] is True
     assert output["goal_complete"] is False
     assert output["may_call_update_goal"] is False
+    assert "APPROVE:cli-secret" not in stdout
+
+
+def test_cli_exposes_agent_session_real_gate_ledger_with_redacted_stdout(tmp_path, capsys):
+    run_dir = tmp_path / "revit_operator_runs" / "cli-evidence"
+    run_dir.mkdir(parents=True)
+    (run_dir / "agent_session_approval_private_material.json").write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-agent-session-approval-material/v1",
+                "approval_items": [{"id": "reload-links", "approval_token": "APPROVE:cli-secret"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "agent-session-real-gate-ledger-cli-test",
+            "agent-session-real-gate-ledger",
+            "--objective",
+            "have revit autonomously handle arbitrary ui flows",
+            "--no-refresh-supervision-status",
+        ]
+    )
+
+    assert code == 0
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
+    assert output["success"] is True
+    assert output["goal_complete"] is False
+    assert output["may_call_update_goal"] is False
+    assert output["execution_guard"]["may_execute_from_this_result"] is False
     assert "APPROVE:cli-secret" not in stdout
 
 

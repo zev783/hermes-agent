@@ -14,7 +14,7 @@ from .operations import OperationRequest, open_model, queue_operation
 from .readiness import wait_model_ready
 from .safety import APPROVAL_REQUIRED, BLOCK, classify_action, validate_output_path
 from .session_checkpoint import build_agent_session_resume_plan, write_agent_session_checkpoint
-from .supervision import audit_supervision_endurance, supervise_session
+from .supervision import audit_supervision_endurance, build_supervision_status, supervise_session
 from .uia import uia_tree
 from .ui_workflows import UI_WORKFLOWS, run_ui_workflow
 from .windows import RevitWindowObserver
@@ -565,6 +565,177 @@ def build_agent_session_completion_audit(
                 "blocked_count": result["blocked_count"],
                 "goal_complete": goal_complete,
                 "may_call_update_goal": goal_complete,
+            },
+            "output_files": result["output_files"],
+        }
+    )
+    return sanitized
+
+
+def build_agent_session_real_gate_ledger(
+    journal: TaskJournal,
+    *,
+    objective: str = DEFAULT_AGENT_COMPLETION_OBJECTIVE,
+    artifact_root: Path | None = None,
+    max_artifacts: int = 500,
+    target_hours: float = 4.0,
+    refresh_supervision_status: bool = True,
+) -> dict:
+    """Write a read-only ledger of real-world gates that still block completion."""
+
+    started_at = utc_now()
+    objective_text = " ".join(str(objective or DEFAULT_AGENT_COMPLETION_OBJECTIVE).split())
+    root = artifact_root or journal.sandbox
+    path_error = validate_output_path(root, journal.sandbox)
+    if path_error:
+        return {
+            "success": False,
+            "error": path_error,
+            "goal_complete": False,
+            "may_call_update_goal": False,
+            "completion_allowed": False,
+            "may_execute_from_this_result": False,
+        }
+
+    supervision_status = None
+    if refresh_supervision_status:
+        supervision_status = build_supervision_status(
+            journal,
+            target_hours=target_hours,
+            require_live_window=True,
+        )
+
+    completion = build_agent_session_completion_audit(
+        journal,
+        objective=objective_text,
+        artifact_root=root,
+        max_artifacts=max_artifacts,
+        target_hours=target_hours,
+    )
+    if not completion.get("success"):
+        return {
+            "success": False,
+            "error": completion.get("error") or "completion audit failed",
+            "completion_audit": completion,
+            "goal_complete": False,
+            "may_call_update_goal": False,
+            "completion_allowed": False,
+            "may_execute_from_this_result": False,
+        }
+
+    gates = [
+        _real_gate_ledger_row(gate, objective=objective_text, target_hours=target_hours)
+        for gate in completion.get("hard_completion_gates", [])
+    ]
+    blocked_gates = [gate for gate in gates if not gate.get("passed")]
+    ready_gates = [
+        gate
+        for gate in blocked_gates
+        if gate.get("status") == "ready_for_human_or_real_condition"
+    ]
+    missing_readiness_gates = [
+        gate
+        for gate in blocked_gates
+        if gate.get("status") == "blocked_missing_readiness_evidence"
+    ]
+    next_actions = [
+        action
+        for gate in blocked_gates
+        for action in gate.get("next_read_only_actions", [])
+    ]
+    goal_complete = bool(completion.get("goal_complete"))
+    status = (
+        "completion_ready"
+        if goal_complete
+        else "waiting_on_human_or_real_conditions"
+        if ready_gates
+        else "blocked_missing_readiness_evidence"
+    )
+    output = journal.run_dir / "agent_session_real_gate_ledger.json"
+    md_path = journal.run_dir / "agent_session_real_gate_ledger.md"
+    result = {
+        "success": True,
+        "read_only": True,
+        "planned_only": True,
+        "label": DRAFT_LABEL,
+        "schema": "hermes-revit-agent-session-real-gate-ledger/v1",
+        "created_at": started_at,
+        "objective": objective_text,
+        "artifact_root": str(root),
+        "status": status,
+        "reason": (
+            "Strict completion audit says all real gates are satisfied."
+            if goal_complete
+            else "One or more real approval, prompt, model-change, or endurance gates still lack live evidence."
+        ),
+        "completion_audit": {
+            "path": completion.get("path"),
+            "status": completion.get("status"),
+            "blocked_count": completion.get("blocked_count"),
+            "goal_complete": completion.get("goal_complete"),
+            "may_call_update_goal": completion.get("may_call_update_goal"),
+        },
+        "supervision_status": _supervision_status_summary(supervision_status),
+        "gate_summary": {
+            "total": len(gates),
+            "passed": len([gate for gate in gates if gate.get("passed")]),
+            "ready_for_human_or_real_condition": len(ready_gates),
+            "blocked_missing_readiness_evidence": len(missing_readiness_gates),
+            "blocked": len(blocked_gates),
+        },
+        "real_gates": gates,
+        "pending_real_conditions": [
+            gate.get("next_required_real_condition")
+            for gate in blocked_gates
+            if gate.get("next_required_real_condition")
+        ],
+        "next_read_only_actions": next_actions,
+        "next_actions_are_read_only": all(action.get("read_only") for action in next_actions),
+        "execution_guard": {
+            "may_execute_from_this_result": False,
+            "approval_tokens_included": False,
+            "approval_phrases_included": False,
+            "private_approval_material_withheld": True,
+            "requires_fresh_human_confirmation_for_execution": True,
+            "requires_fresh_pre_action_observation": True,
+            "completion_authority": "agent-session-completion-audit",
+        },
+        "goal_complete": goal_complete,
+        "completion_allowed": bool(completion.get("completion_allowed")),
+        "may_call_update_goal": bool(completion.get("may_call_update_goal")),
+        "path": str(output),
+        "markdown_path": str(md_path),
+        "output_files": _dedupe(
+            [
+                str(output),
+                str(md_path),
+                completion.get("path"),
+                completion.get("markdown_path"),
+                *((supervision_status or {}).get("output_files") or []),
+            ]
+        ),
+        "journal": journal.describe(),
+    }
+    sanitized = _without_approval_tokens(result)
+    _write_json(output, journal.sandbox, sanitized)
+    _write_text(md_path, journal.sandbox, _real_gate_ledger_markdown(sanitized))
+    journal.write_entry(
+        {
+            "command": "agent-session-real-gate-ledger",
+            "requested_action": {
+                "objective": objective_text,
+                "artifact_root": str(root),
+                "target_hours": target_hours,
+                "refresh_supervision_status": refresh_supervision_status,
+            },
+            "risk_classification": classify_action("agent-session-real-gate-ledger", {}).to_dict(),
+            "approval_status": {"allowed": True, "reason": "Read-only real-gate ledger only."},
+            "result": {
+                "status": result["status"],
+                "blocked_gates": result["gate_summary"]["blocked"],
+                "goal_complete": goal_complete,
+                "may_call_update_goal": result["may_call_update_goal"],
+                "may_execute_from_this_result": False,
             },
             "output_files": result["output_files"],
         }
@@ -2660,6 +2831,164 @@ def _completion_command_check(command: str) -> dict:
     }
 
 
+def _real_gate_ledger_row(gate: dict, *, objective: str, target_hours: float) -> dict:
+    readiness = gate.get("readiness_evidence") if isinstance(gate.get("readiness_evidence"), list) else []
+    passed = bool(gate.get("passed"))
+    status = (
+        "passed"
+        if passed
+        else "ready_for_human_or_real_condition"
+        if readiness
+        else "blocked_missing_readiness_evidence"
+    )
+    actions = _real_gate_next_readonly_actions(gate, objective=objective, target_hours=target_hours)
+    return {
+        "id": gate.get("id"),
+        "requirement_id": gate.get("requirement_id"),
+        "passed": passed,
+        "status": status,
+        "reason": gate.get("reason"),
+        "readiness_count": len(readiness),
+        "readiness_evidence": readiness,
+        "next_required_real_condition": None if passed else gate.get("next_required_real_condition"),
+        "next_read_only_actions": actions,
+        "next_actions_are_read_only": all(action.get("read_only") for action in actions),
+    }
+
+
+def _real_gate_next_readonly_actions(gate: dict, *, objective: str, target_hours: float) -> list[dict]:
+    gate_id = str(gate.get("id") or "")
+    if bool(gate.get("passed")):
+        return []
+    if gate_id == "arbitrary-ui-live-execution":
+        return [
+            _gate_action(
+                "refresh-ui-candidates",
+                _command(["agent-ui-flow-scout", "--objective", objective, "--include-uia"]),
+                "Refresh the live UI candidate list before any human-approved UI action.",
+            ),
+            _gate_action(
+                "dry-run-approved-ui-candidate",
+                _command(
+                    [
+                        "agent-ui-flow-execute-approved-candidate",
+                        "--approval-material",
+                        "<agent_ui_flow_approval_private_material.json>",
+                        "--item-id",
+                        "<ui-candidate-id>",
+                    ]
+                ),
+                "Dry-run a private approval item without --execute before requesting human confirmation.",
+            ),
+        ]
+    if gate_id == "approved-model-change-live-execution":
+        return [
+            _gate_action(
+                "refresh-model-change-approval-plan",
+                _command(["agent-session-approval-plan", "--objective", objective]),
+                "Refresh model-change approval material without queueing Revit work.",
+            ),
+            _gate_action(
+                "dry-run-approved-model-change",
+                _command(
+                    [
+                        "agent-session-execute-approved-item",
+                        "--approval-material",
+                        "<agent_session_approval_private_material.json>",
+                        "--item-id",
+                        "<approval-item-id>",
+                        "--bridge-refresh-timeout",
+                        "0",
+                    ]
+                ),
+                "Dry-run the guarded model-change item without --execute or write guards.",
+            ),
+        ]
+    if gate_id == "model-open-full-prompt-and-ready":
+        return [
+            _gate_action(
+                "observe-model-open-choreography",
+                _command(
+                    [
+                        "agent-model-open-choreography",
+                        "--model",
+                        "<copied-local-model>",
+                        "--revit-version",
+                        "2025",
+                    ]
+                ),
+                "Observe model-open prompt choreography against a copied local model.",
+            ),
+            _gate_action(
+                "plan-model-open-prompt-approval",
+                _command(
+                    [
+                        "agent-model-open-prompt-approval-plan",
+                        "--choreography",
+                        "<model_open_choreography.json>",
+                    ]
+                ),
+                "Classify observed model-open prompts and prepare approval material.",
+            ),
+            _gate_action(
+                "verify-model-ready",
+                _command(["wait-model-ready", "--timeout", "0"]),
+                "Verify active-document readiness after approved prompt handling.",
+            ),
+        ]
+    if gate_id == "multi-hour-live-supervision-target":
+        return [
+            _gate_action(
+                "refresh-supervision-status",
+                _command(["agent-session-supervision-status", "--target-hours", str(target_hours)]),
+                "Refresh active supervision process/log status.",
+            ),
+            _gate_action(
+                "audit-supervision-endurance",
+                _command(["supervision-endurance-audit", "--target-hours", str(target_hours)]),
+                "Check whether accumulated live observation has met the endurance target.",
+            ),
+        ]
+    return [
+        _gate_action(
+            "refresh-evidence",
+            _command(["agent-session-evidence-refresh", "--objective", objective, "--target-hours", str(target_hours)]),
+            "Refresh read-only evidence for this gate.",
+        )
+    ]
+
+
+def _gate_action(kind: str, command: str, reason: str) -> dict:
+    check = _completion_command_check(command)
+    return {
+        "kind": kind,
+        "command": command,
+        "read_only": check["read_only"],
+        "contains_execute_flag": check["contains_execute_flag"],
+        "contains_approval_token": check["contains_approval_token"],
+        "reason": reason,
+    }
+
+
+def _supervision_status_summary(status: dict | None) -> dict:
+    if not isinstance(status, dict):
+        return {"refreshed": False}
+    audit = status.get("endurance_audit") if isinstance(status.get("endurance_audit"), dict) else {}
+    return {
+        "refreshed": True,
+        "path": status.get("path"),
+        "markdown_path": status.get("markdown_path"),
+        "status": status.get("status"),
+        "reason": status.get("reason"),
+        "target_hours": status.get("target_hours"),
+        "active_supervision_count": status.get("active_supervision_count"),
+        "log_count": status.get("log_count"),
+        "target_met": audit.get("target_met"),
+        "total_live_hours": audit.get("total_live_hours"),
+        "qualifying_log_count": audit.get("qualifying_log_count"),
+    }
+
+
 def _artifacts_by_schema(artifacts: list[dict], *schemas: str) -> list[dict]:
     wanted = set(schemas)
     return [artifact for artifact in artifacts if artifact.get("schema") in wanted]
@@ -3314,6 +3643,69 @@ def _completion_audit_markdown(result: dict) -> str:
     lines.extend(["", "## Next Read-Only Commands", ""])
     for command in result.get("next_recommended_commands", []):
         lines.append(f"- `{command}`")
+    return "\n".join(lines) + "\n"
+
+
+def _real_gate_ledger_markdown(result: dict) -> str:
+    guard = result.get("execution_guard") if isinstance(result.get("execution_guard"), dict) else {}
+    summary = result.get("gate_summary") if isinstance(result.get("gate_summary"), dict) else {}
+    completion = result.get("completion_audit") if isinstance(result.get("completion_audit"), dict) else {}
+    supervision = result.get("supervision_status") if isinstance(result.get("supervision_status"), dict) else {}
+    lines = [
+        "# Revit Agent Real Gate Ledger",
+        "",
+        DRAFT_LABEL,
+        "",
+        f"Status: `{result.get('status')}`",
+        f"Goal complete: `{str(result.get('goal_complete')).lower()}`",
+        f"May call update_goal: `{str(result.get('may_call_update_goal')).lower()}`",
+        f"May execute from this result: `{str(guard.get('may_execute_from_this_result')).lower()}`",
+        f"Reason: {result.get('reason')}",
+        "",
+        "## Completion Audit",
+        "",
+        f"- status: `{completion.get('status')}`",
+        f"- blocked_count: `{completion.get('blocked_count')}`",
+        f"- path: `{completion.get('path')}`",
+        "",
+        "## Supervision",
+        "",
+        f"- status: `{supervision.get('status')}`",
+        f"- active_supervision_count: `{supervision.get('active_supervision_count')}`",
+        f"- target_met: `{str(supervision.get('target_met')).lower()}`",
+        f"- total_live_hours: `{supervision.get('total_live_hours')}`",
+        "",
+        "## Gate Summary",
+        "",
+        f"- total: `{summary.get('total')}`",
+        f"- passed: `{summary.get('passed')}`",
+        f"- ready_for_human_or_real_condition: `{summary.get('ready_for_human_or_real_condition')}`",
+        f"- blocked_missing_readiness_evidence: `{summary.get('blocked_missing_readiness_evidence')}`",
+        "",
+        "## Real Gates",
+        "",
+    ]
+    for gate in result.get("real_gates", []):
+        lines.append(
+            f"- `{gate.get('id')}`: status=`{gate.get('status')}` "
+            f"readiness_count=`{gate.get('readiness_count')}`"
+        )
+        if gate.get("next_required_real_condition"):
+            lines.append(f"  next: {gate.get('next_required_real_condition')}")
+    lines.extend(["", "## Next Read-Only Actions", ""])
+    for action in result.get("next_read_only_actions", []):
+        lines.append(f"- `{action.get('command')}`")
+    if not result.get("next_read_only_actions"):
+        lines.append("- None.")
+    lines.extend(["", "## Execution Guard", ""])
+    for key in (
+        "approval_tokens_included",
+        "approval_phrases_included",
+        "private_approval_material_withheld",
+        "requires_fresh_human_confirmation_for_execution",
+        "requires_fresh_pre_action_observation",
+    ):
+        lines.append(f"- {key}: `{str(guard.get(key)).lower()}`")
     return "\n".join(lines) + "\n"
 
 

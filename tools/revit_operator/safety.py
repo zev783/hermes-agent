@@ -392,6 +392,26 @@ def classify_action(action: str, payload: dict | None = None) -> SafetyDecision:
     action_norm = _norm(action)
     target_text = _norm(json.dumps(payload, sort_keys=True))
 
+    if action_norm == "agent-model-open-choreography":
+        if bool(payload.get("execute_open")):
+            token = approval_token_for(action_norm, payload)
+            return SafetyDecision(
+                action=action_norm,
+                risk=HIGH,
+                decision=APPROVAL_REQUIRED,
+                reason=(
+                    "Model-open choreography may launch Revit; the wrapped "
+                    "open-model call must also authorize the exact launch payload."
+                ),
+                approval_token=token,
+            )
+        return SafetyDecision(
+            action=action_norm,
+            risk=LOW,
+            decision=ALLOW,
+            reason="Observation/read-only model-open choreography planning.",
+        )
+
     if action_norm in OBSERVATION_ACTIONS:
         return SafetyDecision(
             action=action_norm,

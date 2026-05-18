@@ -1623,8 +1623,15 @@ def _model_open_commands(model_path: str, expected_revit_version: str, expected_
         if expected_revit_version:
             open_args.extend(["--revit-version", expected_revit_version])
         commands.append(_command(open_args))
+        choreography_args = ["agent-model-open-choreography", "--model", model_path]
+        if expected_revit_version:
+            choreography_args.extend(["--revit-version", expected_revit_version])
+        if expected_title_contains:
+            choreography_args.extend(["--expected-title-contains", expected_title_contains])
+        commands.append(_command(choreography_args))
     else:
         commands.append("open-model --model <copied-local-model>")
+        commands.append("agent-model-open-choreography --model <copied-local-model>")
     commands.extend(
         [
             "wait-for-dialog --timeout 5",

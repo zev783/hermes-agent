@@ -52,6 +52,7 @@ from .dialog_workflows import (
 )
 from .execution_audit import audit_ui_execution_coverage
 from .journal import TaskJournal
+from .model_open_choreography import run_model_open_choreography
 from .navigation import find_views
 from .north_star import (
     build_north_star_blocked_ledger,
@@ -810,6 +811,25 @@ def build_parser() -> argparse.ArgumentParser:
     open_cmd.add_argument("--worksets", choices=["all", "none", "prompt"], default=None)
     open_cmd.add_argument("--allow-model-outside-safe-root", action="store_true")
 
+    open_choreography = sub.add_parser(
+        "agent-model-open-choreography",
+        help="Plan or run guarded copied-model open choreography without answering prompts.",
+    )
+    open_choreography.add_argument("--model", required=True)
+    open_choreography.add_argument("--revit-version", default="")
+    open_choreography.add_argument("--revit-exe", default="")
+    open_choreography.add_argument("--expected-title-contains", default="")
+    open_choreography.add_argument("--expected-path-contains", default="")
+    open_choreography.add_argument("--detach", action="store_true")
+    open_choreography.add_argument("--allow-upgrade", action="store_true")
+    open_choreography.add_argument("--worksets", choices=["all", "none", "prompt"], default=None)
+    open_choreography.add_argument("--execute-open", action="store_true")
+    open_choreography.add_argument("--approval-token")
+    open_choreography.add_argument("--allow-model-outside-safe-root", action="store_true")
+    open_choreography.add_argument("--timeout", type=float, default=120.0)
+    open_choreography.add_argument("--poll", type=float, default=2.0)
+    open_choreography.add_argument("--max-prompt-checks", type=int, default=12)
+
     operation = sub.add_parser("request-operation", help="Queue an in-Revit add-in operation.")
     _add_action_flags(operation)
     operation.add_argument(
@@ -1108,6 +1128,7 @@ _STDOUT_REDACTED_APPROVAL_COMMANDS = {
     "agent-session-plan",
     "agent-session-run",
     "agent-ui-flow-scout",
+    "agent-model-open-choreography",
     "agent-session-approval-plan",
     "agent-session-execute-approved-item",
 }
@@ -1997,6 +2018,29 @@ def dispatch(args: argparse.Namespace) -> dict:
                 dry_run=not args.execute,
                 approval_token=args.approval_token,
                 allow_outside_safe_root=args.allow_model_outside_safe_root,
+            ),
+            "journal": journal.describe(),
+        }
+    elif command == "agent-model-open-choreography":
+        return {
+            **run_model_open_choreography(
+                journal,
+                observer,
+                bridge,
+                model_path=Path(args.model),
+                revit_version=args.revit_version,
+                revit_exe=args.revit_exe,
+                expected_title_contains=args.expected_title_contains,
+                expected_path_contains=args.expected_path_contains,
+                detach=args.detach,
+                allow_upgrade=args.allow_upgrade,
+                worksets=args.worksets,
+                execute_open=args.execute_open,
+                approval_token=args.approval_token,
+                allow_model_outside_safe_root=args.allow_model_outside_safe_root,
+                timeout=args.timeout,
+                poll=args.poll,
+                max_prompt_checks=args.max_prompt_checks,
             ),
             "journal": journal.describe(),
         }

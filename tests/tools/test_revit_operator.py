@@ -33,6 +33,7 @@ from tools.revit_operator.dialog_workflows import (
 )
 from tools.revit_operator.execution_audit import audit_ui_execution_coverage
 from tools.revit_operator.journal import TaskJournal
+import tools.revit_operator.model_open_choreography as model_open_choreography
 from tools.revit_operator.navigation import find_view_matches
 import tools.revit_operator.north_star as north_star
 from tools.revit_operator.north_star import run_north_star_audit
@@ -23666,3 +23667,181 @@ def test_cli_exposes_agent_ui_flow_scout_command(tmp_path, capsys, monkeypatch):
     assert output["status"] == "candidates_found"
     assert output["candidate_count"] >= 1
     assert "APPROVE:" not in stdout
+
+
+def test_model_open_choreography_dry_run_redacts_open_approval(tmp_path):
+    class FakeObserver:
+        def status(self):
+            return {"state": "idle", "active_dialogs": [], "revit_running": True}
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+    model = tmp_path / "sample-R25.rvt"
+    model.write_text("not a real model", encoding="utf-8")
+
+    def fake_open_model(*_args, **_kwargs):
+        return {
+            "success": True,
+            "dry_run": True,
+            "policy": {"decision": APPROVAL_REQUIRED, "approval_token": "APPROVE:open-secret"},
+            "next_step": "Re-run with --approval-token APPROVE:open-secret",
+            "operation_plan": {"expected_prompts": ["upgrade-model"]},
+        }
+
+    journal = TaskJournal(tmp_path, "model-open-choreography-dry-run-test")
+    result = model_open_choreography.run_model_open_choreography(
+        journal,
+        FakeObserver(),
+        RevitBridgeClient(tmp_path),
+        model_path=model,
+        revit_version="2025",
+        allow_model_outside_safe_root=True,
+        open_model_func=fake_open_model,
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "planned_open"
+    assert result["planned_only"] is True
+    assert result["safety_summary"]["open_executed"] is False
+    assert "APPROVE:open-secret" not in json.dumps(result)
+    assert (journal.run_dir / "model_open_choreography.json").exists()
+
+
+def test_model_open_choreography_stops_on_existing_prompt(tmp_path):
+    class FakeObserver:
+        def status(self):
+            return {"state": "modal", "active_dialogs": [{"title": "Upgrade model"}], "revit_running": True}
+
+        def list_dialogs(self):
+            return {
+                "supported": True,
+                "dialogs": [
+                    {
+                        "hwnd": 42,
+                        "title": "Upgrade model",
+                        "dialog_text": "This model must be upgraded before it can be opened.",
+                        "buttons": ["Cancel", "Upgrade"],
+                    }
+                ],
+            }
+
+    model = tmp_path / "sample-R25.rvt"
+    model.write_text("not a real model", encoding="utf-8")
+    called = False
+
+    def fake_open_model(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return {"success": True}
+
+    result = model_open_choreography.run_model_open_choreography(
+        TaskJournal(tmp_path, "model-open-existing-prompt-test"),
+        FakeObserver(),
+        RevitBridgeClient(tmp_path),
+        model_path=model,
+        allow_model_outside_safe_root=True,
+        open_model_func=fake_open_model,
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "blocked_existing_prompt"
+    assert called is False
+    assert result["prompt_events"][0]["plans"][0]["known_dialog_id"] == "upgrade-model"
+    assert result["safety_summary"]["prompt_button_clicked"] is False
+
+
+def test_model_open_choreography_execute_stops_on_post_launch_prompt(tmp_path):
+    class FakeObserver:
+        def __init__(self):
+            self.dialog_calls = 0
+
+        def status(self):
+            return {"state": "modal", "active_dialogs": [{"title": "Open Worksets"}], "revit_running": True}
+
+        def list_dialogs(self):
+            self.dialog_calls += 1
+            if self.dialog_calls == 1:
+                return {"supported": True, "dialogs": []}
+            return {
+                "supported": True,
+                "dialogs": [
+                    {
+                        "hwnd": 77,
+                        "title": "Open Worksets",
+                        "dialog_text": "Specify worksets to open.",
+                        "buttons": ["OK", "Cancel"],
+                    }
+                ],
+            }
+
+    model = tmp_path / "sample-R25.rvt"
+    model.write_text("not a real model", encoding="utf-8")
+
+    def fake_open_model(*_args, **_kwargs):
+        return {"success": True, "dry_run": False, "launched": True, "pid": 1234}
+
+    result = model_open_choreography.run_model_open_choreography(
+        TaskJournal(tmp_path, "model-open-post-prompt-test"),
+        FakeObserver(),
+        RevitBridgeClient(tmp_path),
+        model_path=model,
+        execute_open=True,
+        approval_token="APPROVE:test",
+        allow_model_outside_safe_root=True,
+        timeout=1,
+        poll=0.1,
+        open_model_func=fake_open_model,
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "stopped_on_prompt"
+    assert result["prompt_events"][0]["plans"][0]["known_dialog_id"] == "open-worksets"
+    assert result["safety_summary"]["open_executed"] is True
+    assert result["safety_summary"]["prompt_button_clicked"] is False
+
+
+def test_cli_exposes_model_open_choreography_command(tmp_path, capsys, monkeypatch):
+    class FakeObserver:
+        def status(self):
+            return {"state": "idle", "active_dialogs": [], "revit_running": True}
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+    model = tmp_path / "sample-R25.rvt"
+    model.write_text("not a real model", encoding="utf-8")
+
+    def fake_open_model(*_args, **_kwargs):
+        return {
+            "success": True,
+            "dry_run": True,
+            "policy": {"decision": APPROVAL_REQUIRED, "approval_token": "APPROVE:cli-secret"},
+            "next_step": "Re-run with --approval-token APPROVE:cli-secret",
+        }
+
+    monkeypatch.setattr(cli, "RevitWindowObserver", lambda: FakeObserver())
+    monkeypatch.setattr(model_open_choreography, "open_model", fake_open_model)
+
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "model-open-choreography-cli-test",
+            "agent-model-open-choreography",
+            "--model",
+            str(model),
+            "--revit-version",
+            "2025",
+            "--allow-model-outside-safe-root",
+        ]
+    )
+
+    assert code == 0
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
+    assert output["success"] is True
+    assert output["status"] == "planned_open"
+    assert "APPROVE:cli-secret" not in stdout

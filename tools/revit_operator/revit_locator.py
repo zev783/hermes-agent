@@ -54,10 +54,11 @@ def resolve_revit_exe(version: str | None = None, explicit: str | None = None) -
         default_exe = default_revit_install_dir(normalized) / "Revit.exe"
         if default_exe.exists():
             return default_exe
-        version = normalized
+        versions = installed_revit_versions()
+        if normalized in versions:
+            return Path(versions[normalized])
+        return None
     versions = installed_revit_versions()
-    if version and version in versions:
-        return Path(versions[version])
     if versions:
         latest = sorted(versions)[-1]
         return Path(versions[latest])

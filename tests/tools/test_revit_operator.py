@@ -44,6 +44,7 @@ from tools.revit_operator.project_browser import (
     run_project_browser_visual_activation,
 )
 from tools.revit_operator.readiness import wait_model_ready
+import tools.revit_operator.revit_locator as revit_locator
 from tools.revit_operator.revit_locator import infer_revit_version_from_model
 from tools.revit_operator.recovery import capture_recovery_snapshot, validate_recovery_drill_matrix
 import tools.revit_operator.ribbon as ribbon
@@ -17381,6 +17382,18 @@ def test_r25_filename_infers_revit_2025():
 )
 def test_revit_filename_markers_infer_supported_versions(marker, version):
     assert infer_revit_version_from_model(Path(f"Example-Structural_Current-{marker}-BIM.rvt")) == version
+
+
+def test_resolve_revit_exe_specific_version_does_not_fallback(monkeypatch, tmp_path):
+    latest_exe = tmp_path / "Revit 2027" / "Revit.exe"
+    latest_exe.parent.mkdir(parents=True)
+    latest_exe.write_text("fake exe", encoding="utf-8")
+
+    monkeypatch.setattr(revit_locator, "default_revit_install_dir", lambda version: tmp_path / f"Revit {version}")
+    monkeypatch.setattr(revit_locator, "installed_revit_versions", lambda root=revit_locator.DEFAULT_AUTODESK_ROOT: {"2027": str(latest_exe)})
+
+    assert revit_locator.resolve_revit_exe("2026") is None
+    assert revit_locator.resolve_revit_exe(None) == latest_exe
 
 
 def test_revit_version_support_matrix_covers_2022_to_2027():

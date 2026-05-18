@@ -44,6 +44,8 @@ daytona = ["daytona>=0.148.0,<1"]
 vercel = ["vercel>=0.5.7,<0.6.0"]
 dev = ["debugpy>=1.8.0,<2", "pytest>=9.0.2,<10", "pytest-asyncio>=1.3.0,<2", "pytest-xdist>=3.0,<4", "mcp>=1.2.0,<2", "ty>=0.0.1a29,<0.0.22", "ruff"]
 messaging = ["python-telegram-bot[webhooks]>=22.6,<23", "discord.py[voice]>=2.7.1,<3", "aiohttp>=3.13.3,<4", "slack-bolt>=1.18.0,<2", "slack-sdk>=3.27.0,<4", "qrcode>=7.0,<8"]
+revit = ["pywinauto>=0.6.9,<0.7; sys_platform == 'win32'"]
+revit-ocr = ["Pillow>=10,<13", "pytesseract>=0.3.13,<0.4", "rapidocr-onnxruntime>=1.4.4,<1.5"]
 cron = []  # croniter is now a core dependency; this extra kept for back-compat
 slack = ["slack-bolt>=1.18.0,<2", "slack-sdk>=3.27.0,<4"]
 matrix = ["mautrix[encryption]>=0.20,<1", "Markdown>=3.6,<4", "aiosqlite>=0.20", "asyncpg>=0.29", "aiohttp-socks>=0.10,<1"]
@@ -121,6 +123,7 @@ all = [
   "hermes-agent[sms]",
   "hermes-agent[acp]",
   "hermes-agent[voice]",
+  "hermes-agent[revit]",
   "hermes-agent[dingtalk]",
   "hermes-agent[feishu]",
   "hermes-agent[google]",
@@ -133,6 +136,8 @@ all = [
 hermes = "hermes_cli.main:main"
 hermes-agent = "run_agent:main"
 hermes-acp = "acp_adapter.entry:main"
+revit-operator = "tools.revit_operator.cli:main"
+revit-operator-mcp = "tools.revit_operator.mcp_server:main"
 
 [tool.setuptools]
 py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajectory_compressor", "toolset_distributions", "cli", "hermes_constants", "hermes_state", "hermes_time", "hermes_logging", "rl_cli", "utils"]
@@ -140,6 +145,13 @@ py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajector
 [tool.setuptools.package-data]
 hermes_cli = ["web_dist/**/*"]
 gateway = ["assets/**/*"]
+tools = [
+  "revit_operator/addin/*.cs",
+  "revit_operator/addin/*.csproj",
+  "revit_operator/addin/*.md",
+  "revit_operator/addin/*.ps1",
+  "revit_operator/addin/*.template",
+]
 
 [tool.setuptools.packages.find]
 include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*"]

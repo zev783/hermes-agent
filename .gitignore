@@ -70,3 +70,11 @@ mini-swe-agent/
 result
 website/static/api/skills-index.json
 models-dev-upstream/
+
+# Revit operator local build/test artifacts
+.tmp-dotnet/
+.pytest_tmp*/
+.tmp-pytest-*/
+.tmp-revit-*/
+tools/revit_operator/addin/bin/
+tools/revit_operator/addin/obj/

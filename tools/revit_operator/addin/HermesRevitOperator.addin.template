@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<RevitAddIns>
+  <AddIn Type="Application">
+    <Name>Hermes Revit Operator</Name>
+    <Assembly>{{ASSEMBLY_PATH}}</Assembly>
+    <AddInId>9B9E5F15-C0B3-4D2A-8E4D-5F7D07F81A11</AddInId>
+    <FullClassName>Hermes.RevitOperator.HermesRevitOperatorApp</FullClassName>
+    <VendorId>HERM</VendorId>
+    <VendorDescription>Hermes local Revit human-operator bridge</VendorDescription>
+  </AddIn>
+</RevitAddIns>

@@ -109,6 +109,7 @@ OBSERVATION_ACTIONS = {
     "agent-session-plan",
     "agent-session-run",
     "agent-session-checkpoint",
+    "agent-session-resume-plan",
     "agent-ui-flow-scout",
     "agent-ui-flow-approval-plan",
     "agent-model-open-prompt-approval-plan",

@@ -24592,3 +24592,157 @@ def test_cli_exposes_agent_session_checkpoint_command(tmp_path, capsys, monkeypa
     assert output["status"] == "resume_ready"
     assert output["goal_complete"] is False
     assert "APPROVE:" not in stdout
+
+
+def test_agent_session_resume_plan_uses_resume_ready_checkpoint(tmp_path):
+    class FakeObserver:
+        def status(self):
+            return {"state": "idle", "active_dialogs": [], "revit_running": True, "main_window": {"hwnd": 1}}
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+    class FakeBridge:
+        def bridge_status(self):
+            return {"available": True, "status": "connected"}
+
+        def active_document_status(self):
+            return {"available": True, "document": {"title": "Model"}}
+
+        def read_command_results(self):
+            return []
+
+    checkpoint_journal = TaskJournal(tmp_path, "agent-session-resume-checkpoint-ready")
+    checkpoint = session_checkpoint.write_agent_session_checkpoint(
+        checkpoint_journal,
+        FakeObserver(),
+        FakeBridge(),
+        objective="Inspect sheets for hours.",
+        expected_revit_version="2025",
+    )
+    result = session_checkpoint.build_agent_session_resume_plan(
+        TaskJournal(tmp_path, "agent-session-resume-plan-ready"),
+        checkpoint_path=Path(checkpoint["path"]),
+        resume_minutes=15,
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "resume_ready"
+    assert result["recommended_next_action"] == "resume_readonly_preflight"
+    commands = {step["id"]: step["command"] for step in result["resume_sequence"]}
+    assert "session-preflight" in commands
+    assert "timed-supervision-resume" in commands
+    assert result["resume_safety"]["commands_are_read_only"] is True
+    assert result["resume_safety"]["contains_execute_flag"] is False
+    assert result["resume_safety"]["contains_approval_token"] is False
+
+
+def test_agent_session_resume_plan_blocks_on_modal_checkpoint(tmp_path):
+    class FakeObserver:
+        def status(self):
+            return {"state": "modal", "active_dialogs": [{"title": "Upgrade model"}], "revit_running": True}
+
+        def list_dialogs(self):
+            return {
+                "supported": True,
+                "dialogs": [{"title": "Upgrade model", "dialog_text": "Upgrade required.", "buttons": ["Cancel", "Upgrade"]}],
+            }
+
+    class FakeBridge:
+        def bridge_status(self):
+            return {"available": True, "status": "connected"}
+
+        def active_document_status(self):
+            return {"available": True, "document": {"title": "Model"}}
+
+        def read_command_results(self):
+            return []
+
+    checkpoint = session_checkpoint.write_agent_session_checkpoint(
+        TaskJournal(tmp_path, "agent-session-resume-checkpoint-modal"),
+        FakeObserver(),
+        FakeBridge(),
+        objective="Open copied model.",
+    )
+    result = session_checkpoint.build_agent_session_resume_plan(
+        TaskJournal(tmp_path, "agent-session-resume-plan-modal"),
+        checkpoint_path=Path(checkpoint["path"]),
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "blocked"
+    assert result["recommended_next_action"] == "classify_prompt"
+    commands = {step["id"]: step["command"] for step in result["resume_sequence"]}
+    assert commands["classify-current-dialog"] == "plan-current-dialog-response"
+    assert "agent-model-open-prompt-approval-plan" in commands["model-open-prompt-approval-plan"]
+    assert result["resume_safety"]["contains_execute_flag"] is False
+    assert result["resume_safety"]["contains_approval_token"] is False
+
+
+def test_agent_session_resume_plan_finds_latest_checkpoint(tmp_path):
+    checkpoint_dir = tmp_path / "revit_operator_runs" / "manual-checkpoint"
+    checkpoint_dir.mkdir(parents=True)
+    checkpoint_path = checkpoint_dir / "agent_session_checkpoint.json"
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-agent-session-checkpoint/v1",
+                "created_at": "2026-05-18T00:00:00Z",
+                "objective": "Inspect sheets.",
+                "status": "resume_ready",
+                "state": "idle",
+                "blockers": [],
+                "resume_commands": [{"id": "fresh-status", "command": "status", "reason": "Refresh."}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = session_checkpoint.build_agent_session_resume_plan(
+        TaskJournal(tmp_path, "agent-session-resume-plan-latest"),
+    )
+
+    assert result["success"] is True
+    assert result["checkpoint_path"] == str(checkpoint_path)
+    assert result["status"] == "resume_ready"
+
+
+def test_cli_exposes_agent_session_resume_plan_command(tmp_path, capsys):
+    checkpoint_dir = tmp_path / "revit_operator_runs" / "cli-checkpoint"
+    checkpoint_dir.mkdir(parents=True)
+    checkpoint_path = checkpoint_dir / "agent_session_checkpoint.json"
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-agent-session-checkpoint/v1",
+                "created_at": "2026-05-18T00:00:00Z",
+                "objective": "Inspect sheets.",
+                "status": "resume_ready",
+                "state": "idle",
+                "blockers": [],
+                "resume_commands": [{"id": "fresh-status", "command": "status", "reason": "Refresh."}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "agent-session-resume-plan-cli-test",
+            "agent-session-resume-plan",
+            "--checkpoint",
+            str(checkpoint_path),
+        ]
+    )
+
+    assert code == 0
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
+    assert output["success"] is True
+    assert output["status"] == "resume_ready"
+    assert "APPROVE:" not in stdout
+    assert "--execute" not in stdout

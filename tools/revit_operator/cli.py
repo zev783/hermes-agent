@@ -101,7 +101,7 @@ from .recovery import capture_recovery_snapshot, validate_recovery_drill_matrix
 from .revit_locator import default_test_model_info, installed_revit_versions
 from .ribbon import list_ribbon_actions, plan_ribbon_action, run_ribbon_action, validate_ribbon_action_matrix
 from .safety import classify_action, classify_dialog, validate_output_path, validate_sandbox_root
-from .session_checkpoint import write_agent_session_checkpoint
+from .session_checkpoint import build_agent_session_resume_plan, write_agent_session_checkpoint
 from .supervision import audit_supervision_endurance, supervise_session, validate_supervision_endurance_matrix
 from .supervised_ops import run_supervised_ops_audit
 from .transport_safety import build_transport_safety_matrix
@@ -979,6 +979,14 @@ def build_parser() -> argparse.ArgumentParser:
     agent_session_checkpoint.add_argument("--expected-path-contains", default="")
     agent_session_checkpoint.add_argument("--bridge-result-limit", type=int, default=10)
 
+    agent_session_resume = sub.add_parser(
+        "agent-session-resume-plan",
+        help="Build a read-only resume plan from an agent-session-checkpoint artifact.",
+    )
+    agent_session_resume.add_argument("--checkpoint", default="")
+    agent_session_resume.add_argument("--supervision-log", default="")
+    agent_session_resume.add_argument("--resume-minutes", type=float, default=30.0)
+
     agent_ui_scout = sub.add_parser(
         "agent-ui-flow-scout",
         help="Observe current Revit UI and propose approval-gated candidates for an arbitrary UI objective.",
@@ -1177,6 +1185,7 @@ _STDOUT_REDACTED_APPROVAL_COMMANDS = {
     "agent-session-plan",
     "agent-session-run",
     "agent-session-checkpoint",
+    "agent-session-resume-plan",
     "agent-ui-flow-scout",
     "agent-ui-flow-approval-plan",
     "agent-ui-flow-execute-approved-candidate",
@@ -2285,6 +2294,16 @@ def dispatch(args: argparse.Namespace) -> dict:
                 expected_title_contains=args.expected_title_contains,
                 expected_path_contains=args.expected_path_contains,
                 bridge_result_limit=args.bridge_result_limit,
+            ),
+            "journal": journal.describe(),
+        }
+    elif command == "agent-session-resume-plan":
+        return {
+            **build_agent_session_resume_plan(
+                journal,
+                checkpoint_path=Path(args.checkpoint) if args.checkpoint else None,
+                supervision_log_path=Path(args.supervision_log) if args.supervision_log else None,
+                resume_minutes=args.resume_minutes,
             ),
             "journal": journal.describe(),
         }

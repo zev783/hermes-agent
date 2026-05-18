@@ -2603,6 +2603,7 @@ def _completion_hard_gates(artifacts: list[dict], *, target_hours: float) -> lis
 def _completion_next_commands(objective: str, *, target_hours: float) -> list[str]:
     return [
         _command(["agent-session-evidence-refresh", "--objective", objective, "--target-hours", str(target_hours)]),
+        _command(["agent-session-supervision-status", "--target-hours", str(target_hours)]),
         _command(["agent-session-checkpoint", "--objective", objective]),
         _command(["agent-session-resume-plan", "--checkpoint", "<agent_session_checkpoint.json>"]),
         _command(["agent-ui-flow-scout", "--objective", objective, "--include-uia"]),
@@ -2987,6 +2988,7 @@ def _build_phases(
             "purpose": "Keep a long-running task observable, resumable, and auditable.",
             "commands": [
                 _command(["agent-session-evidence-refresh", "--objective", objective_text]),
+                _command(["agent-session-supervision-status", "--target-hours", str(max_hours)]),
                 _command(["agent-session-checkpoint", "--objective", objective_text]),
                 _command(["agent-session-resume-plan", "--checkpoint", "<agent_session_checkpoint.json>"]),
                 f"supervise-session --duration {int(max(0.1, max_hours) * 3600)} --poll 30 --stop-on-modal",

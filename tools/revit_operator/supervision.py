@@ -383,6 +383,142 @@ def audit_supervision_endurance(
     return result
 
 
+def build_supervision_status(
+    journal: TaskJournal,
+    *,
+    target_hours: float = 4.0,
+    require_live_window: bool = True,
+    audit_now: datetime | None = None,
+) -> dict:
+    """Summarize active supervision logs and the current endurance target."""
+
+    audit_now = (audit_now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    runs_root = journal.sandbox / "revit_operator_runs"
+    log_paths = sorted(runs_root.glob("*/supervision_log.json")) if runs_root.exists() else []
+    records = [
+        _supervision_log_record(path, require_live_window=require_live_window, audit_now=audit_now)
+        for path in log_paths
+    ]
+    active = [
+        record
+        for record in records
+        if record.get("in_progress") and record.get("supervisor_pid_running") is True
+    ]
+    endurance = audit_supervision_endurance(
+        journal,
+        target_hours=target_hours,
+        require_live_window=require_live_window,
+        audit_now=audit_now,
+    )
+    status = "target_met" if endurance.get("target_met") else "active" if active else "insufficient_evidence"
+    result = {
+        "success": True,
+        "read_only": True,
+        "live_ui_touched": False,
+        "schema": "hermes-revit-agent-session-supervision-status/v1",
+        "created_at": _format_utc_timestamp(audit_now),
+        "status": status,
+        "reason": _supervision_status_reason(status, active, endurance),
+        "target_hours": float(target_hours),
+        "log_count": len(records),
+        "active_supervision_count": len(active),
+        "active_supervision_logs": active[:10],
+        "recent_supervision_logs": sorted(
+            records,
+            key=lambda item: str(item.get("last_check_at") or item.get("path") or ""),
+            reverse=True,
+        )[:10],
+        "endurance_audit": {
+            "path": endurance.get("path"),
+            "status": endurance.get("status"),
+            "target_met": endurance.get("target_met"),
+            "total_live_hours": endurance.get("total_live_hours"),
+            "qualifying_log_count": endurance.get("qualifying_log_count"),
+            "excluded_log_count": endurance.get("excluded_log_count"),
+        },
+        "goal_complete": False,
+        "may_call_update_goal": False,
+        "note": (
+            "Read-only status only. This command scans sandbox supervision logs "
+            "and process liveness; it does not focus, click, type, or modify Revit."
+        ),
+    }
+    output = journal.run_dir / "agent_session_supervision_status.json"
+    markdown = journal.run_dir / "agent_session_supervision_status.md"
+    error = validate_output_path(output, journal.sandbox) or validate_output_path(markdown, journal.sandbox)
+    if error:
+        return {"success": False, "error": error, "goal_complete": False, "may_call_update_goal": False}
+    result["path"] = str(output)
+    result["markdown_path"] = str(markdown)
+    result["output_files"] = [str(output), str(markdown), endurance.get("path")]
+    output.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+    markdown.write_text(_supervision_status_markdown(result), encoding="utf-8")
+    journal.write_entry(
+        {
+            "command": "agent-session-supervision-status",
+            "requested_action": {
+                "target_hours": target_hours,
+                "require_live_window": require_live_window,
+            },
+            "risk_classification": classify_action("agent-session-supervision-status", {}).to_dict(),
+            "approval_status": {"allowed": True, "reason": "Read-only supervision status scan."},
+            "result": {
+                "status": status,
+                "active_supervision_count": len(active),
+                "target_met": endurance.get("target_met"),
+                "goal_complete": False,
+            },
+            "output_files": result["output_files"],
+        }
+    )
+    return result
+
+
+def _supervision_status_reason(status: str, active: list[dict], endurance: dict) -> str:
+    if status == "target_met":
+        return "The configured supervision endurance target has current qualifying evidence."
+    if status == "active":
+        return f"{len(active)} supervision process/log appears active, but the endurance target is not met yet."
+    if endurance.get("log_count"):
+        return "Supervision logs exist, but they do not yet satisfy the endurance target."
+    return "No qualifying live supervision log evidence was found."
+
+
+def _supervision_status_markdown(result: dict) -> str:
+    lines = [
+        "# Revit Agent Supervision Status",
+        "",
+        f"Status: `{result.get('status')}`",
+        f"Goal complete: `{str(result.get('goal_complete')).lower()}`",
+        f"May call update_goal: `{str(result.get('may_call_update_goal')).lower()}`",
+        f"Reason: {result.get('reason')}",
+        "",
+        "## Endurance",
+        "",
+    ]
+    audit = result.get("endurance_audit") if isinstance(result.get("endurance_audit"), dict) else {}
+    lines.extend(
+        [
+            f"- target_hours: `{result.get('target_hours')}`",
+            f"- target_met: `{str(audit.get('target_met')).lower()}`",
+            f"- total_live_hours: `{audit.get('total_live_hours')}`",
+            f"- active_supervision_count: `{result.get('active_supervision_count')}`",
+            f"- audit_path: `{audit.get('path')}`",
+            "",
+            "## Active Logs",
+            "",
+        ]
+    )
+    for record in result.get("active_supervision_logs", []):
+        lines.append(
+            f"- `{record.get('task_id')}`: checks=`{record.get('check_count')}` "
+            f"pid=`{record.get('supervisor_pid')}`"
+        )
+    if not result.get("active_supervision_logs"):
+        lines.append("- None.")
+    return "\n".join(lines) + "\n"
+
+
 def validate_supervision_endurance_matrix(journal: TaskJournal) -> dict:
     """Run synthetic supervision drills that exercise resume/stall behavior.
 

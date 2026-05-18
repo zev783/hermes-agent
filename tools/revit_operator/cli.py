@@ -104,7 +104,12 @@ from .revit_locator import default_test_model_info, installed_revit_versions
 from .ribbon import list_ribbon_actions, plan_ribbon_action, run_ribbon_action, validate_ribbon_action_matrix
 from .safety import classify_action, classify_dialog, validate_output_path, validate_sandbox_root
 from .session_checkpoint import build_agent_session_resume_plan, write_agent_session_checkpoint
-from .supervision import audit_supervision_endurance, supervise_session, validate_supervision_endurance_matrix
+from .supervision import (
+    audit_supervision_endurance,
+    build_supervision_status,
+    supervise_session,
+    validate_supervision_endurance_matrix,
+)
 from .supervised_ops import run_supervised_ops_audit
 from .transport_safety import build_transport_safety_matrix
 from .ui_workflows import (
@@ -724,6 +729,16 @@ def build_parser() -> argparse.ArgumentParser:
     supervision_audit.add_argument("--target-hours", type=float, default=2.0)
     supervision_audit.add_argument("--min-checks", type=int, default=24)
     supervision_audit.add_argument(
+        "--allow-logs-without-live-window",
+        action="store_true",
+        help="Include supervision logs that do not contain main-window evidence.",
+    )
+    supervision_status = sub.add_parser(
+        "agent-session-supervision-status",
+        help="Summarize active supervision logs and current endurance progress without touching Revit.",
+    )
+    supervision_status.add_argument("--target-hours", type=float, default=4.0)
+    supervision_status.add_argument(
         "--allow-logs-without-live-window",
         action="store_true",
         help="Include supervision logs that do not contain main-window evidence.",
@@ -2013,6 +2028,12 @@ def dispatch(args: argparse.Namespace) -> dict:
             journal,
             target_hours=args.target_hours,
             min_checks=args.min_checks,
+            require_live_window=not args.allow_logs_without_live_window,
+        )
+    elif command == "agent-session-supervision-status":
+        result = build_supervision_status(
+            journal,
+            target_hours=args.target_hours,
             require_live_window=not args.allow_logs_without_live_window,
         )
     elif command == "ui-execution-coverage-audit":

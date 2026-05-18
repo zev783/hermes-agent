@@ -75,6 +75,7 @@ from tools.revit_operator.safety import (
 import tools.revit_operator.session_checkpoint as session_checkpoint
 from tools.revit_operator.supervision import (
     audit_supervision_endurance,
+    build_supervision_status,
     supervise_session,
     validate_supervision_endurance_matrix,
 )
@@ -1916,6 +1917,7 @@ def test_process_and_wait_observation_actions_are_allowed():
     assert classify_action("supervise-session").decision == "allow"
     assert classify_action("supervision-endurance-matrix").decision == "allow"
     assert classify_action("supervision-endurance-audit").decision == "allow"
+    assert classify_action("agent-session-supervision-status").decision == "allow"
     assert classify_action("recovery-drill-matrix").decision == "allow"
     assert classify_action("workflow-approval-plan").decision == "allow"
     assert classify_action(
@@ -22540,6 +22542,105 @@ def test_supervision_endurance_audit_reports_in_progress_supervisor_pid(tmp_path
     assert result["stale_in_progress_log_count"] == 0
     assert result["qualifying_logs"][0]["supervisor_pid"] == os.getpid()
     assert result["qualifying_logs"][0]["supervisor_pid_running"] is True
+
+
+def test_agent_session_supervision_status_reports_active_pid(tmp_path):
+    run_dir = tmp_path / "revit_operator_runs" / "live-supervise-status-running"
+    run_dir.mkdir(parents=True)
+    (run_dir / "supervision_log.json").write_text(
+        json.dumps(
+            {
+                "success": True,
+                "checkpoint_status": "running",
+                "in_progress": True,
+                "supervisor_pid": os.getpid(),
+                "segments": [
+                    {
+                        "started_at": "2026-05-12T10:00:00Z",
+                        "finished_at": "2026-05-12T10:05:00Z",
+                        "stop_reason": "running",
+                    }
+                ],
+                "checks": [
+                    {
+                        "checked_at": "2026-05-12T10:00:00Z",
+                        "state": "idle",
+                        "main_window": {"hwnd": 100},
+                    },
+                    {
+                        "checked_at": "2026-05-12T10:05:00Z",
+                        "state": "idle",
+                        "main_window": {"hwnd": 100},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = build_supervision_status(
+        TaskJournal(tmp_path, "agent-session-supervision-status-test"),
+        target_hours=1.0,
+        audit_now=datetime(2026, 5, 12, 10, 10, tzinfo=timezone.utc),
+    )
+
+    assert result["success"] is True
+    assert result["read_only"] is True
+    assert result["status"] == "active"
+    assert result["active_supervision_count"] == 1
+    assert result["endurance_audit"]["target_met"] is False
+    assert result["goal_complete"] is False
+    assert result["may_call_update_goal"] is False
+    assert Path(result["path"]).is_relative_to(tmp_path)
+    assert (TaskJournal(tmp_path, "agent-session-supervision-status-test").run_dir).exists()
+
+
+def test_cli_exposes_agent_session_supervision_status(tmp_path, capsys):
+    run_dir = tmp_path / "revit_operator_runs" / "live-supervise-status-cli"
+    run_dir.mkdir(parents=True)
+    (run_dir / "supervision_log.json").write_text(
+        json.dumps(
+            {
+                "success": True,
+                "checkpoint_status": "complete",
+                "in_progress": False,
+                "segments": [
+                    {
+                        "started_at": "2026-05-12T10:00:00Z",
+                        "finished_at": "2026-05-12T10:05:00Z",
+                        "stop_reason": "duration_elapsed",
+                    }
+                ],
+                "checks": [
+                    {"checked_at": "2026-05-12T10:00:00Z", "state": "idle"},
+                    {"checked_at": "2026-05-12T10:05:00Z", "state": "idle"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "agent-session-supervision-status-cli-test",
+            "agent-session-supervision-status",
+            "--target-hours",
+            "1",
+            "--allow-logs-without-live-window",
+        ]
+    )
+
+    assert code == 0
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
+    assert output["success"] is True
+    assert output["goal_complete"] is False
+    assert output["may_call_update_goal"] is False
+    assert "APPROVE:" not in stdout
 
 
 def test_supervision_endurance_audit_extends_active_running_pid_interval(tmp_path):

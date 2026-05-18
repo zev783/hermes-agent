@@ -72,6 +72,7 @@ from tools.revit_operator.safety import (
     validate_output_path,
     validate_sandbox_root,
 )
+import tools.revit_operator.session_checkpoint as session_checkpoint
 from tools.revit_operator.supervision import (
     audit_supervision_endurance,
     supervise_session,
@@ -23845,3 +23846,119 @@ def test_cli_exposes_model_open_choreography_command(tmp_path, capsys, monkeypat
     assert output["success"] is True
     assert output["status"] == "planned_open"
     assert "APPROVE:cli-secret" not in stdout
+
+
+def test_agent_session_checkpoint_resume_ready_when_idle(tmp_path):
+    class FakeObserver:
+        def status(self):
+            return {"state": "idle", "active_dialogs": [], "revit_running": True, "main_window": {"hwnd": 1}}
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+    class FakeBridge:
+        def bridge_status(self):
+            return {"available": True, "status": "connected"}
+
+        def active_document_status(self):
+            return {"available": True, "document": {"title": "Model"}}
+
+        def read_command_results(self):
+            return [{"id": "latest", "success": True}]
+
+    journal = TaskJournal(tmp_path, "agent-session-checkpoint-ready-test")
+    result = session_checkpoint.write_agent_session_checkpoint(
+        journal,
+        FakeObserver(),
+        FakeBridge(),
+        objective="Inspect sheets for hours.",
+        expected_revit_version="2025",
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "resume_ready"
+    assert result["blockers"] == []
+    assert any(command["id"] == "session-preflight" for command in result["resume_commands"])
+    assert all("--execute" not in command["command"] for command in result["resume_commands"])
+    assert (journal.run_dir / "agent_session_checkpoint.json").exists()
+    assert (journal.run_dir / "agent_session_checkpoints.jsonl").exists()
+
+
+def test_agent_session_checkpoint_blocks_on_modal_dialog(tmp_path):
+    class FakeObserver:
+        def status(self):
+            return {"state": "modal", "active_dialogs": [{"title": "Upgrade model"}], "revit_running": True}
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": [{"title": "Upgrade model", "buttons": ["Cancel", "Upgrade"]}]}
+
+    class FakeBridge:
+        def bridge_status(self):
+            return {"available": False, "status": "stub"}
+
+        def active_document_status(self):
+            return {"available": False}
+
+        def read_command_results(self):
+            return []
+
+    result = session_checkpoint.write_agent_session_checkpoint(
+        TaskJournal(tmp_path, "agent-session-checkpoint-modal-test"),
+        FakeObserver(),
+        FakeBridge(),
+        objective="Open the model.",
+    )
+
+    blocker_ids = {blocker["id"] for blocker in result["blockers"]}
+    resume_ids = {command["id"] for command in result["resume_commands"]}
+    assert result["status"] == "blocked"
+    assert {"revit-state-modal", "active-dialog", "bridge-unavailable", "active-document-unavailable"}.issubset(blocker_ids)
+    assert "classify-current-dialog" in resume_ids
+    assert result["resume_safety"]["contains_approval_token"] is False
+
+
+def test_cli_exposes_agent_session_checkpoint_command(tmp_path, capsys, monkeypatch):
+    class FakeObserver:
+        def status(self):
+            return {"state": "idle", "active_dialogs": [], "revit_running": True, "main_window": {"hwnd": 1}}
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+    class FakeBridge:
+        def __init__(self, _sandbox):
+            pass
+
+        def bridge_status(self):
+            return {"available": True, "status": "connected"}
+
+        def active_document_status(self):
+            return {"available": True, "document": {"title": "Model"}}
+
+        def read_command_results(self):
+            return []
+
+    monkeypatch.setattr(cli, "RevitWindowObserver", lambda: FakeObserver())
+    monkeypatch.setattr(cli, "RevitBridgeClient", FakeBridge)
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "agent-session-checkpoint-cli-test",
+            "agent-session-checkpoint",
+            "--objective",
+            "Inspect sheets for hours.",
+            "--expected-revit-version",
+            "2025",
+        ]
+    )
+
+    assert code == 0
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
+    assert output["success"] is True
+    assert output["status"] == "resume_ready"
+    assert output["goal_complete"] is False
+    assert "APPROVE:" not in stdout

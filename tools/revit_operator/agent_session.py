@@ -1580,6 +1580,7 @@ def _build_phases(
             "requires_approval": False,
             "purpose": "Keep a long-running task observable, resumable, and auditable.",
             "commands": [
+                _command(["agent-session-checkpoint", "--objective", objective_text]),
                 f"supervise-session --duration {int(max(0.1, max_hours) * 3600)} --poll 30 --stop-on-modal",
                 f"supervision-endurance-audit --target-hours {max_hours}",
             ],

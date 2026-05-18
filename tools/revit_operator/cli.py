@@ -95,6 +95,7 @@ from .recovery import capture_recovery_snapshot, validate_recovery_drill_matrix
 from .revit_locator import default_test_model_info, installed_revit_versions
 from .ribbon import list_ribbon_actions, plan_ribbon_action, run_ribbon_action, validate_ribbon_action_matrix
 from .safety import classify_action, classify_dialog, validate_output_path, validate_sandbox_root
+from .session_checkpoint import write_agent_session_checkpoint
 from .supervision import audit_supervision_endurance, supervise_session, validate_supervision_endurance_matrix
 from .supervised_ops import run_supervised_ops_audit
 from .transport_safety import build_transport_safety_matrix
@@ -946,6 +947,16 @@ def build_parser() -> argparse.ArgumentParser:
     agent_session_run.add_argument("--supervision-poll", type=float, default=5.0)
     agent_session_run.add_argument("--supervision-max-checks", type=int)
 
+    agent_session_checkpoint = sub.add_parser(
+        "agent-session-checkpoint",
+        help="Write a read-only resumability checkpoint for a long-running Revit agent session.",
+    )
+    agent_session_checkpoint.add_argument("--objective", default="")
+    agent_session_checkpoint.add_argument("--expected-revit-version", default="")
+    agent_session_checkpoint.add_argument("--expected-title-contains", default="")
+    agent_session_checkpoint.add_argument("--expected-path-contains", default="")
+    agent_session_checkpoint.add_argument("--bridge-result-limit", type=int, default=10)
+
     agent_ui_scout = sub.add_parser(
         "agent-ui-flow-scout",
         help="Observe current Revit UI and propose approval-gated candidates for an arbitrary UI objective.",
@@ -1127,6 +1138,7 @@ _STDOUT_REDACTED_APPROVAL_COMMANDS = {
     "north-star-unblock-readiness",
     "agent-session-plan",
     "agent-session-run",
+    "agent-session-checkpoint",
     "agent-ui-flow-scout",
     "agent-model-open-choreography",
     "agent-session-approval-plan",
@@ -2196,6 +2208,20 @@ def dispatch(args: argparse.Namespace) -> dict:
                 supervision_duration=args.supervision_duration,
                 supervision_poll=args.supervision_poll,
                 supervision_max_checks=args.supervision_max_checks,
+            ),
+            "journal": journal.describe(),
+        }
+    elif command == "agent-session-checkpoint":
+        return {
+            **write_agent_session_checkpoint(
+                journal,
+                observer,
+                bridge,
+                objective=args.objective,
+                expected_revit_version=args.expected_revit_version,
+                expected_title_contains=args.expected_title_contains,
+                expected_path_contains=args.expected_path_contains,
+                bridge_result_limit=args.bridge_result_limit,
             ),
             "journal": journal.describe(),
         }

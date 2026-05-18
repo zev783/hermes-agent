@@ -87,6 +87,7 @@ from .revit_locator import default_test_model_info, installed_revit_versions
 from .ribbon import list_ribbon_actions, plan_ribbon_action, run_ribbon_action, validate_ribbon_action_matrix
 from .safety import classify_action, classify_dialog, validate_output_path, validate_sandbox_root
 from .supervision import audit_supervision_endurance, supervise_session, validate_supervision_endurance_matrix
+from .supervised_ops import run_supervised_ops_audit
 from .transport_safety import build_transport_safety_matrix
 from .ui_workflows import (
     list_ui_workflows,
@@ -722,6 +723,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include executed entries without before/after live UI observation evidence.",
     )
 
+    sub.add_parser(
+        "supervised-ops-audit",
+        help="Write an expanded supervised Revit operation audit/report for the active goal.",
+    )
     sub.add_parser("workflow-library", help="List sandboxed recorded Revit workflow templates.")
     sub.add_parser("ui-workflows", help="List guarded reusable Revit UI workflow recipes.")
     sub.add_parser("ui-workflow-matrix", help="Validate guarded UI workflow recipes without running live Revit commands.")
@@ -885,6 +890,17 @@ def build_parser() -> argparse.ArgumentParser:
     type_text = sub.add_parser("type-text", help="Type guarded text via optional pywinauto.")
     _add_action_flags(type_text)
     type_text.add_argument("--text", required=True)
+
+    visual_click = sub.add_parser(
+        "visual-click",
+        help="Click exact screen coordinates through the guarded visual fallback primitive.",
+    )
+    _add_action_flags(visual_click)
+    visual_click.add_argument("--screen-x", type=int, required=True)
+    visual_click.add_argument("--screen-y", type=int, required=True)
+    visual_click.add_argument("--hwnd", type=int)
+    visual_click.add_argument("--target-text", default="")
+    visual_click.add_argument("--coordinate-source", default="manual")
 
     logs = sub.add_parser("task-log", help="List or show task journal paths.")
     logs.add_argument("--latest", action="store_true")
@@ -1782,6 +1798,8 @@ def dispatch(args: argparse.Namespace) -> dict:
             required_surfaces=_csv_list(args.required_surfaces),
             require_live_evidence=not args.allow_without_live_evidence,
         )
+    elif command == "supervised-ops-audit":
+        result = run_supervised_ops_audit(journal)
     elif command == "workflow-library":
         result = list_workflows(sandbox)
     elif command == "ui-workflows":
@@ -1982,7 +2000,7 @@ def dispatch(args: argparse.Namespace) -> dict:
             ),
             "journal": journal.describe(),
         }
-    elif command in {"focus", "press-key", "click", "type-text", "uia-invoke"}:
+    elif command in {"focus", "press-key", "click", "type-text", "uia-invoke", "visual-click"}:
         executor = SafeActionExecutor(observer, journal)
         payload = _action_payload(args)
         return {
@@ -2043,6 +2061,14 @@ def _action_payload(args: argparse.Namespace) -> dict:
         payload["target"] = args.target
     if getattr(args, "text", None):
         payload["text"] = args.text
+    if getattr(args, "screen_x", None) is not None:
+        payload["screen_x"] = args.screen_x
+    if getattr(args, "screen_y", None) is not None:
+        payload["screen_y"] = args.screen_y
+    if getattr(args, "target_text", None):
+        payload["target_text"] = args.target_text
+    if getattr(args, "coordinate_source", None):
+        payload["coordinate_source"] = args.coordinate_source
     if getattr(args, "name", None):
         payload["name"] = args.name
     if getattr(args, "control_type", None):

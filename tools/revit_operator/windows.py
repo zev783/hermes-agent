@@ -605,6 +605,17 @@ class RevitWindowObserver:
                 or extracted.get("controls")
             )
             owned_by_main = bool(main and window.owner_hwnd == main.hwnd)
+            contentless_zero_area = not has_content and (
+                window.rect.width <= 0 or window.rect.height <= 0
+            )
+            contentless_background_shell = (
+                not has_content
+                and owned_by_main
+                and not window.foreground
+                and bool(main and main.enabled)
+            )
+            if contentless_zero_area or contentless_background_shell:
+                continue
             if has_content or owned_by_main:
                 dialogs.append(window)
         return dialogs

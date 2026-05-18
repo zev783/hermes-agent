@@ -69,6 +69,7 @@ from tools.revit_operator.supervision import (
     supervise_session,
     validate_supervision_endurance_matrix,
 )
+from tools.revit_operator.supervised_ops import run_supervised_ops_audit
 from tools.revit_operator.transport_safety import (
     PLUGIN_ALLOW_EXTERNAL_SANDBOX_ENV,
     build_transport_safety_matrix,
@@ -87,7 +88,7 @@ from tools.revit_operator.uia import (
     uia_tree,
     validate_uia_method_matrix,
 )
-from tools.revit_operator.windows import find_controls_in_tree
+from tools.revit_operator.windows import Rect, RevitWindowObserver, WindowInfo, find_controls_in_tree
 from tools.revit_operator.workflow_memory import plan_workflow_approvals, record_workflow, replay_workflow
 from tools.revit_operator.workflows import run_readonly_qa_workflow
 
@@ -134,6 +135,215 @@ def _test_preflight_freshness(*, generated_offset_seconds=0, ttl_seconds=900):
         "expires_at_unix": expires_at,
         "freshness_rule": "test freshness metadata",
     }
+
+
+def _fake_revit_window(
+    *,
+    hwnd: int,
+    title: str,
+    rect: Rect,
+    owner_hwnd: int = 0,
+    is_dialog_like: bool = False,
+    enabled: bool = True,
+    foreground: bool | None = None,
+) -> WindowInfo:
+    return WindowInfo(
+        hwnd=hwnd,
+        pid=30012,
+        title=title,
+        class_name="HwndWrapper[DefaultDomain;;test]",
+        rect=rect,
+        visible=True,
+        enabled=enabled,
+        foreground=(owner_hwnd == 0 if foreground is None else foreground),
+        owner_hwnd=owner_hwnd,
+        process_path="C:\\Program Files\\Autodesk\\Revit 2025\\Revit.exe",
+        process_name="Revit.exe",
+        revit_version="2025",
+        is_revit_related=True,
+        is_dialog_like=is_dialog_like,
+        is_hung=False,
+    )
+
+
+def test_dialog_windows_ignore_contentless_zero_area_owned_windows(monkeypatch):
+    observer = object.__new__(RevitWindowObserver)
+    main = _fake_revit_window(
+        hwnd=1,
+        title="Autodesk Revit 2025 - [Model]",
+        rect=Rect(0, 0, 1200, 900),
+    )
+    phantom = _fake_revit_window(
+        hwnd=2,
+        title="",
+        rect=Rect(0, 0, 0, 0),
+        owner_hwnd=main.hwnd,
+        is_dialog_like=True,
+    )
+    monkeypatch.setattr(
+        observer,
+        "_extract_dialog_content",
+        lambda _hwnd: {"dialog_text": "", "buttons": [], "controls": []},
+    )
+
+    assert observer._dialog_windows([main, phantom]) == []
+
+
+def test_dialog_windows_ignore_contentless_background_owned_shell(monkeypatch):
+    observer = object.__new__(RevitWindowObserver)
+    main = _fake_revit_window(
+        hwnd=1,
+        title="Autodesk Revit 2025 - [Model]",
+        rect=Rect(0, 0, 1200, 900),
+        enabled=True,
+        foreground=True,
+    )
+    shell = _fake_revit_window(
+        hwnd=2,
+        title="",
+        rect=Rect(100, 100, 500, 500),
+        owner_hwnd=main.hwnd,
+        is_dialog_like=True,
+        foreground=False,
+    )
+    monkeypatch.setattr(
+        observer,
+        "_extract_dialog_content",
+        lambda _hwnd: {"dialog_text": "", "buttons": [], "controls": []},
+    )
+
+    assert observer._dialog_windows([main, shell]) == []
+
+
+def test_dialog_windows_keep_contentless_foreground_owned_shell_when_main_disabled(monkeypatch):
+    observer = object.__new__(RevitWindowObserver)
+    main = _fake_revit_window(
+        hwnd=1,
+        title="Autodesk Revit 2025 - [Model]",
+        rect=Rect(0, 0, 1200, 900),
+        enabled=False,
+        foreground=False,
+    )
+    shell = _fake_revit_window(
+        hwnd=2,
+        title="",
+        rect=Rect(100, 100, 500, 500),
+        owner_hwnd=main.hwnd,
+        is_dialog_like=True,
+        foreground=True,
+    )
+    monkeypatch.setattr(
+        observer,
+        "_extract_dialog_content",
+        lambda _hwnd: {"dialog_text": "", "buttons": [], "controls": []},
+    )
+
+    assert observer._dialog_windows([main, shell]) == [shell]
+
+
+def test_supervised_ops_audit_rejects_zero_area_false_modal_recovery(tmp_path):
+    journal = TaskJournal(tmp_path, "supervised-audit-test")
+    run_dir = journal.run_dir
+    (run_dir / "metadata").mkdir(exist_ok=True)
+    (run_dir / "screenshots").mkdir(exist_ok=True)
+    (run_dir / "metadata" / "metadata-20260518T000000Z.json").write_text("{}", encoding="utf-8")
+    (run_dir / "screenshots" / "screenshot.bmp").write_bytes(b"BM")
+    (run_dir / "qa_report.md").write_text("DRAFT / NOT FOR PERMIT / REQUIRES PE REVIEW", encoding="utf-8")
+    (run_dir / "model_ready_status.json").write_text(
+        json.dumps({"success": True, "ready": True, "path": str(run_dir / "model_ready_status.json")}),
+        encoding="utf-8",
+    )
+    (run_dir / "project_browser_navigation_plan.json").write_text(
+        json.dumps(
+            {
+                "success": True,
+                "view_lookup_count": 1,
+                "path": str(run_dir / "project_browser_navigation_plan.json"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "dialog_workflow_matrix.json").write_text(
+        json.dumps({"success": True, "failed_cases": [], "case_count": 1, "path": "dialog.json"}),
+        encoding="utf-8",
+    )
+    (run_dir / "action_approval_matrix.json").write_text(
+        json.dumps(
+            {
+                "path": "actions.json",
+                "cases": [
+                    {"name": "click-save-blocked", "policy": {"decision": "block"}},
+                    {"name": "uia-save-blocked", "policy": {"decision": "block"}},
+                    {
+                        "name": "request-save-critical-approval",
+                        "policy": {"decision": "approval_required", "risk": "critical"},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "metadata" / "transport_safety_matrix.json").write_text(
+        json.dumps({"path": "transport.json", "status": "clean", "success": True, "failed_check_ids": []}),
+        encoding="utf-8",
+    )
+    (run_dir / "ui_execution_coverage_audit.json").write_text(
+        json.dumps(
+            {
+                "path": "coverage.json",
+                "target_met": True,
+                "missing_required_surfaces": [],
+                "qualifying_executions": [
+                    {"task_id": journal.task_id, "surfaces": ["focus"]},
+                    {"task_id": journal.task_id, "surfaces": ["ribbon-action"]},
+                    {"task_id": journal.task_id, "surfaces": ["ribbon-action"]},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    journal.write_entry(
+        {
+            "command": "wait-bridge-result",
+            "result": {
+                "bridge_result": {
+                    "id": "activate_view-20260518T000000Z-test",
+                    "success": False,
+                    "error": "Setting active view is temporarily disabled.",
+                }
+            },
+        }
+    )
+    (run_dir / "recovery_snapshot.json").write_text(
+        json.dumps(
+            {
+                "path": str(run_dir / "recovery_snapshot.json"),
+                "status": {"state": "modal", "active_dialogs": []},
+                "dialogs": {
+                    "dialogs": [
+                        {
+                            "title": "",
+                            "dialog_text": "",
+                            "buttons": [],
+                            "controls": [],
+                            "rect": {"width": 0, "height": 0},
+                        }
+                    ]
+                },
+                "validated_live_recovery_drill": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_supervised_ops_audit(journal)
+
+    assert result["success"] is True
+    assert result["goal_complete"] is False
+    assert "live-modal-or-stuck-recovery" in result["unsatisfied_ids"]
+    assert "DRAFT / NOT FOR PERMIT / REQUIRES PE REVIEW" in Path(result["markdown_path"]).read_text(
+        encoding="utf-8"
+    )
 
 
 def test_revit_operator_runbook_requires_sequential_north_star_artifact_refresh():
@@ -19162,6 +19372,43 @@ def test_cli_click_dry_run_returns_approval_token_and_does_not_execute(tmp_path,
     assert output["executed"] is False
     assert output["policy"]["decision"] == APPROVAL_REQUIRED
     assert output["policy"]["approval_token"].startswith("APPROVE:")
+
+
+def test_cli_visual_click_dry_run_returns_coordinate_payload(tmp_path, capsys):
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "visual-click-cli-test",
+            "visual-click",
+            "--screen-x",
+            "245",
+            "--screen-y",
+            "134",
+            "--target-text",
+            "Visibility/Graphics",
+            "--coordinate-source",
+            "test-screenshot",
+        ]
+    )
+
+    assert code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["dry_run"] is True
+    assert output["executed"] is False
+    assert output["policy"]["action"] == "visual-click"
+    assert output["policy"]["decision"] == APPROVAL_REQUIRED
+    assert output["policy"]["approval_token"] == approval_token_for(
+        "visual-click",
+        {
+            "screen_x": 245,
+            "screen_y": 134,
+            "target_text": "Visibility/Graphics",
+            "coordinate_source": "test-screenshot",
+        },
+    )
 
 
 def test_cli_export_metadata_writes_stub_inside_sandbox(tmp_path, capsys):

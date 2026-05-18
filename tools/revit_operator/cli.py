@@ -12,6 +12,7 @@ from pathlib import Path
 from .actions import ActionRequest, SafeActionExecutor, validate_action_approval_matrix
 from .agent_session import (
     build_agent_session_approval_plan,
+    build_ui_flow_candidate_approval_plan,
     execute_agent_session_approved_item,
     plan_agent_session,
     run_agent_session,
@@ -968,6 +969,13 @@ def build_parser() -> argparse.ArgumentParser:
     agent_ui_scout.add_argument("--include-uia", action="store_true")
     agent_ui_scout.add_argument("--uia-limit", type=int, default=500)
 
+    agent_ui_approval = sub.add_parser(
+        "agent-ui-flow-approval-plan",
+        help="Create a redacted approval packet from an agent-ui-flow-scout artifact without executing UI.",
+    )
+    agent_ui_approval.add_argument("--scout", required=True, help="Path to agent_ui_flow_scout.json under the sandbox.")
+    agent_ui_approval.add_argument("--limit", type=int, default=10)
+
     agent_session_approval = sub.add_parser(
         "agent-session-approval-plan",
         help="Create a fresh approval packet for gated Revit agent session phases without executing them.",
@@ -1140,6 +1148,7 @@ _STDOUT_REDACTED_APPROVAL_COMMANDS = {
     "agent-session-run",
     "agent-session-checkpoint",
     "agent-ui-flow-scout",
+    "agent-ui-flow-approval-plan",
     "agent-model-open-choreography",
     "agent-session-approval-plan",
     "agent-session-execute-approved-item",
@@ -2236,6 +2245,15 @@ def dispatch(args: argparse.Namespace) -> dict:
                 capture_screenshot=args.screenshot,
                 include_uia=args.include_uia,
                 uia_limit=args.uia_limit,
+            ),
+            "journal": journal.describe(),
+        }
+    elif command == "agent-ui-flow-approval-plan":
+        return {
+            **build_ui_flow_candidate_approval_plan(
+                journal,
+                scout_path=Path(args.scout),
+                limit=args.limit,
             ),
             "journal": journal.describe(),
         }

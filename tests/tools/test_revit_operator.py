@@ -23677,6 +23677,136 @@ def test_cli_exposes_agent_ui_flow_scout_command(tmp_path, capsys, monkeypatch):
     assert "APPROVE:" not in stdout
 
 
+def test_agent_ui_flow_approval_plan_keeps_candidate_tokens_private(tmp_path):
+    source = TaskJournal(tmp_path, "agent-ui-flow-approval-source")
+    scout_path = source.run_dir / "agent_ui_flow_scout.json"
+    scout_path.write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-agent-ui-flow-scout/v1",
+                "status": "candidates_found",
+                "candidates": [
+                    {
+                        "target": "Manage Links",
+                        "source": "uia",
+                        "control_type": "Button",
+                        "automation_id": "ID_MANAGE_LINKS",
+                        "class_name": "Button",
+                        "hwnd": 303,
+                        "matched_terms": ["manage", "manage links"],
+                        "confidence": "medium",
+                        "path": "Autodesk Revit > Manage > Manage Links",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    journal = TaskJournal(tmp_path, "agent-ui-flow-approval-plan-test")
+    result = agent_session.build_ui_flow_candidate_approval_plan(journal, scout_path=scout_path)
+    public_text = (journal.run_dir / "agent_ui_flow_approval_plan.json").read_text(encoding="utf-8")
+    private_text = (journal.run_dir / "agent_ui_flow_approval_private_material.json").read_text(encoding="utf-8")
+
+    assert result["success"] is True
+    assert result["approval_required_count"] == 1
+    assert result["blocked_count"] == 0
+    assert result["approval_items"][0]["kind"] == "ui-candidate-control"
+    assert result["approval_items"][0]["approval_token_withheld"] is True
+    assert result["approval_items"][0]["execute_command_withheld"] is True
+    assert "uia-invoke" in private_text
+    assert "--execute" in private_text
+    assert "APPROVE:" not in json.dumps(result)
+    assert "APPROVE:" not in public_text
+    assert "APPROVE:" in private_text
+
+
+def test_agent_ui_flow_approval_plan_blocks_destructive_candidate(tmp_path):
+    source = TaskJournal(tmp_path, "agent-ui-flow-blocked-source")
+    scout_path = source.run_dir / "agent_ui_flow_scout.json"
+    scout_path.write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-agent-ui-flow-scout/v1",
+                "status": "candidates_found",
+                "candidates": [
+                    {
+                        "target": "Save",
+                        "source": "uia",
+                        "control_type": "Button",
+                        "automation_id": "ID_SAVE",
+                        "class_name": "Button",
+                        "matched_terms": ["save"],
+                        "confidence": "medium",
+                        "path": "Autodesk Revit > File > Save",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    journal = TaskJournal(tmp_path, "agent-ui-flow-blocked-approval-test")
+    result = agent_session.build_ui_flow_candidate_approval_plan(journal, scout_path=scout_path)
+    private_text = (journal.run_dir / "agent_ui_flow_approval_private_material.json").read_text(encoding="utf-8")
+
+    assert result["success"] is True
+    assert result["approval_required_count"] == 0
+    assert result["blocked_count"] == 1
+    assert result["blocked_items"][0]["id"].startswith("ui-candidate:0:save")
+    assert result["blocked_items"][0]["blocked"] is True
+    assert "APPROVE:" not in json.dumps(result)
+    assert "APPROVE:" not in private_text
+
+
+def test_cli_exposes_agent_ui_flow_approval_plan_with_redacted_stdout(tmp_path, capsys):
+    source = TaskJournal(tmp_path, "agent-ui-flow-approval-cli-source")
+    scout_path = source.run_dir / "agent_ui_flow_scout.json"
+    scout_path.write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-agent-ui-flow-scout/v1",
+                "status": "candidates_found",
+                "candidates": [
+                    {
+                        "target": "Manage Links",
+                        "source": "uia",
+                        "control_type": "Button",
+                        "automation_id": "ID_MANAGE_LINKS",
+                        "class_name": "Button",
+                        "matched_terms": ["manage"],
+                        "confidence": "medium",
+                        "path": "Autodesk Revit > Manage Links",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "agent-ui-flow-approval-cli-test",
+            "agent-ui-flow-approval-plan",
+            "--scout",
+            str(scout_path),
+        ]
+    )
+
+    assert code == 0
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
+    private_path = Path(output["private_material_path"])
+    assert output["success"] is True
+    assert output["approval_required_count"] == 1
+    assert "APPROVE:" not in stdout
+    assert "APPROVE:" in private_path.read_text(encoding="utf-8")
+
+
 def test_model_open_choreography_dry_run_redacts_open_approval(tmp_path):
     class FakeObserver:
         def status(self):

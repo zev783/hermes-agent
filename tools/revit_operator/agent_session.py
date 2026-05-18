@@ -828,6 +828,129 @@ def scout_agent_ui_flow(
     return sanitized
 
 
+def build_ui_flow_candidate_approval_plan(
+    journal: TaskJournal,
+    *,
+    scout_path: Path,
+    limit: int = 10,
+) -> dict:
+    """Turn a UI scout artifact into redacted public approvals and private tokens."""
+
+    path_error = validate_output_path(scout_path, journal.sandbox)
+    if path_error:
+        return {
+            "success": False,
+            "error": path_error,
+            "goal_complete": False,
+            "may_call_update_goal": False,
+            "journal": journal.describe(),
+        }
+    if not scout_path.exists():
+        return {
+            "success": False,
+            "error": f"UI scout artifact not found: {scout_path}",
+            "goal_complete": False,
+            "may_call_update_goal": False,
+            "journal": journal.describe(),
+        }
+    try:
+        scout = json.loads(scout_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return {
+            "success": False,
+            "error": f"Invalid UI scout JSON: {exc}",
+            "goal_complete": False,
+            "may_call_update_goal": False,
+            "journal": journal.describe(),
+        }
+    if not isinstance(scout, dict):
+        return {
+            "success": False,
+            "error": "UI scout artifact must contain a JSON object.",
+            "goal_complete": False,
+            "may_call_update_goal": False,
+            "journal": journal.describe(),
+        }
+
+    candidates = [candidate for candidate in scout.get("candidates") or [] if isinstance(candidate, dict)]
+    public_items: list[dict] = []
+    private_items: list[dict] = []
+    blocked_items: list[dict] = []
+    for index, candidate in enumerate(candidates[: max(0, limit)]):
+        item = _ui_candidate_approval_item(index, candidate)
+        if item.get("blocked"):
+            blocked_items.append(_without_approval_tokens(item["public"]))
+        else:
+            public_items.append(_without_approval_tokens(item["public"]))
+            private_items.append(item["private"])
+
+    private_material = {
+        "label": DRAFT_LABEL,
+        "created_at": utc_now(),
+        "schema": "hermes-revit-agent-ui-flow-approval-material/v1",
+        "source_scout_path": str(scout_path),
+        "source_scout_schema": scout.get("schema"),
+        "source_scout_status": scout.get("status"),
+        "approval_items": private_items,
+        "warning": (
+            "Private UI approval material. Use only after a fresh UI scout and dry-run "
+            "still match the intended Revit state."
+        ),
+    }
+    public = {
+        "success": True,
+        "read_only": True,
+        "planned_only": True,
+        "label": DRAFT_LABEL,
+        "schema": "hermes-revit-agent-ui-flow-approval-plan/v1",
+        "created_at": utc_now(),
+        "source_scout_path": str(scout_path),
+        "source_scout_schema": scout.get("schema"),
+        "source_scout_status": scout.get("status"),
+        "source_candidate_count": len(candidates),
+        "considered_candidate_count": min(max(0, limit), len(candidates)),
+        "approval_required_count": len(public_items),
+        "blocked_count": len(blocked_items),
+        "approval_material_withheld_from_public": True,
+        "approval_items": public_items,
+        "blocked_items": blocked_items,
+        "private_material_contains_approval_tokens": bool(private_items),
+        "goal_complete": False,
+        "may_call_update_goal": False,
+        "safety_note": (
+            "This command creates approval material only. It does not click, type, "
+            "queue model-changing commands, save, sync, publish, or modify Revit."
+        ),
+        "journal": journal.describe(),
+    }
+    public_path = journal.run_dir / "agent_ui_flow_approval_plan.json"
+    private_path = journal.run_dir / "agent_ui_flow_approval_private_material.json"
+    md_path = journal.run_dir / "agent_ui_flow_approval_plan.md"
+    public["path"] = str(public_path)
+    public["private_material_path"] = str(private_path)
+    public["markdown_path"] = str(md_path)
+    public["output_files"] = [str(public_path), str(private_path), str(md_path)]
+    _write_json(public_path, journal.sandbox, _without_approval_tokens(public))
+    _write_json(private_path, journal.sandbox, private_material)
+    _write_text(md_path, journal.sandbox, _ui_flow_approval_plan_markdown(public))
+    journal.write_entry(
+        {
+            "command": "agent-ui-flow-approval-plan",
+            "requested_action": {"scout_path": str(scout_path), "limit": limit},
+            "risk_classification": classify_action("agent-ui-flow-approval-plan", {}).to_dict(),
+            "approval_status": {"allowed": True, "reason": "Approval planning only; no Revit action executed."},
+            "result": {
+                "status": "planned",
+                "approval_required_count": len(public_items),
+                "blocked_count": len(blocked_items),
+                "goal_complete": False,
+            },
+            "output_files": public["output_files"],
+        }
+    )
+    return _without_approval_tokens(public)
+
+
 def _observer_result(observer: RevitWindowObserver, method_name: str) -> dict:
     method = getattr(observer, method_name, None)
     if not callable(method):
@@ -1068,6 +1191,79 @@ def _dedupe_ui_candidates(candidates: list[dict], *, limit: int) -> list[dict]:
     return result
 
 
+def _ui_candidate_approval_item(index: int, candidate: dict) -> dict:
+    target = str(candidate.get("target") or candidate.get("title") or candidate.get("name") or "")
+    payload = {
+        "name": target,
+        "control_type": str(candidate.get("control_type") or ""),
+        "automation_id": str(candidate.get("automation_id") or ""),
+        "class_name": str(candidate.get("class_name") or ""),
+        "method": "invoke",
+        "exact": True,
+    }
+    if candidate.get("hwnd") is not None:
+        payload["hwnd"] = candidate.get("hwnd")
+    policy = classify_action("uia-invoke", payload)
+    policy_payload = policy.to_dict()
+    item_id = f"ui-candidate:{index}:{_workflow_slug(target or f'candidate-{index}')}"
+    public = {
+        "id": item_id,
+        "kind": "ui-candidate-control",
+        "target": target,
+        "source": candidate.get("source"),
+        "path": candidate.get("path"),
+        "matched_terms": candidate.get("matched_terms") or [],
+        "confidence": candidate.get("confidence") or "unknown",
+        "control_type": payload.get("control_type"),
+        "automation_id": payload.get("automation_id"),
+        "class_name": payload.get("class_name"),
+        "hwnd": payload.get("hwnd"),
+        "method": payload.get("method"),
+        "exact": True,
+        "risk": policy_payload.get("risk"),
+        "reason": policy_payload.get("reason"),
+        "policy": _without_approval_tokens(policy_payload),
+        "blocked": policy.decision == BLOCK,
+        "approval_token_withheld": bool(policy_payload.get("approval_token")) and policy.decision != BLOCK,
+        "execute_command_withheld": policy.decision != BLOCK,
+        "inspection_command": _ui_control_details_command(payload),
+        "dry_run_command": _ui_invoke_command(payload, execute=False),
+        "verify_before_execution": [
+            "agent-ui-flow-scout",
+            "uia-control-details",
+            "uia-invoke dry-run",
+            "agent-session-checkpoint",
+        ],
+    }
+    if policy.decision == BLOCK:
+        return {"blocked": True, "public": public}
+    token = str(policy_payload.get("approval_token") or "")
+    private = {
+        **public,
+        "approval_token": token,
+        "execute_command": _ui_candidate_execute_command(payload, token),
+    }
+    return {"blocked": False, "public": public, "private": private}
+
+
+def _ui_candidate_execute_command(payload: dict, approval_token: str) -> str:
+    parts = ["uia-invoke"]
+    if payload.get("name"):
+        parts.extend(["--name", str(payload["name"])])
+    if payload.get("control_type"):
+        parts.extend(["--control-type", str(payload["control_type"])])
+    if payload.get("automation_id"):
+        parts.extend(["--automation-id", str(payload["automation_id"])])
+    if payload.get("class_name"):
+        parts.extend(["--class-name", str(payload["class_name"])])
+    if payload.get("hwnd") is not None:
+        parts.extend(["--hwnd", str(payload["hwnd"])])
+    parts.extend(["--method", str(payload.get("method") or "invoke"), "--exact", "--execute"])
+    if approval_token:
+        parts.extend(["--approval-token", approval_token])
+    return _command(parts)
+
+
 def _candidate_next_actions(candidates: list[dict]) -> list[dict]:
     actions = []
     for candidate in candidates[:5]:
@@ -1137,6 +1333,8 @@ def _ui_control_details_command(payload: dict) -> str:
         parts.extend(["--automation-id", str(payload["automation_id"])])
     if payload.get("class_name"):
         parts.extend(["--class-name", str(payload["class_name"])])
+    if payload.get("hwnd") is not None:
+        parts.extend(["--hwnd", str(payload["hwnd"])])
     parts.append("--exact")
     return _command(parts)
 
@@ -1151,6 +1349,8 @@ def _ui_invoke_command(payload: dict, *, execute: bool) -> str:
         parts.extend(["--automation-id", str(payload["automation_id"])])
     if payload.get("class_name"):
         parts.extend(["--class-name", str(payload["class_name"])])
+    if payload.get("hwnd") is not None:
+        parts.extend(["--hwnd", str(payload["hwnd"])])
     parts.extend(["--method", str(payload.get("method") or "invoke"), "--exact"])
     if execute:
         parts.extend(["--execute", "--approval-token", "<fresh approval token from dry-run>"])
@@ -1572,6 +1772,7 @@ def _build_phases(
                 "purpose": "Route known UI tasks through reusable workflow recipes; unknown UI remains a recording/planning task.",
                 "commands": [
                     _command(["agent-ui-flow-scout", "--objective", objective_text]),
+                    _command(["agent-ui-flow-approval-plan", "--scout", "<agent_ui_flow_scout.json>"]),
                     *[wf["plan_command"] for wf in candidate_workflows],
                 ],
                 "candidate_workflows": [
@@ -1922,6 +2123,33 @@ def _ui_flow_scout_markdown(result: dict) -> str:
     for action in result.get("next_actions", []):
         command = action.get("command") or action.get("dry_run_command") or action.get("inspection_command") or ""
         lines.append(f"- `{action.get('recommended_action')}`: {command}")
+    return "\n".join(lines) + "\n"
+
+
+def _ui_flow_approval_plan_markdown(result: dict) -> str:
+    lines = [
+        "# Revit Agent UI Flow Approval Plan",
+        "",
+        DRAFT_LABEL,
+        "",
+        f"Source scout: `{result.get('source_scout_path')}`",
+        "Goal complete: `false`",
+        f"Approval items: `{result.get('approval_required_count', 0)}`",
+        f"Blocked items: `{result.get('blocked_count', 0)}`",
+        "Approval material withheld from public plan: `true`",
+        "",
+        "## Approval Items",
+        "",
+    ]
+    for item in result.get("approval_items", []):
+        lines.append(f"- `{item.get('id')}`: {item.get('target')} ({item.get('reason')})")
+    if not result.get("approval_items"):
+        lines.append("- None.")
+    lines.extend(["", "## Blocked Items", ""])
+    for item in result.get("blocked_items", []):
+        lines.append(f"- `{item.get('id')}`: {item.get('target')} ({item.get('reason')})")
+    if not result.get("blocked_items"):
+        lines.append("- None.")
     return "\n".join(lines) + "\n"
 
 

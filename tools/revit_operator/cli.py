@@ -10,6 +10,14 @@ import time
 from pathlib import Path
 
 from .actions import ActionRequest, SafeActionExecutor, validate_action_approval_matrix
+from .agent_session import (
+    build_agent_session_approval_plan,
+    execute_agent_session_approved_item,
+    plan_agent_session,
+    run_agent_session,
+    scout_agent_ui_flow,
+)
+from .agent_task import run_agent_task
 from .addin_installer import install_addin
 from .addin_security import addin_security_preflight
 from .addin_trust import trust_addin
@@ -876,6 +884,88 @@ def build_parser() -> argparse.ArgumentParser:
     qa_workflow.add_argument("--focus-approval-token", help="Exact focus approval token for --focus-hwnd.")
     qa_workflow.add_argument("--idle-nudge", action="store_true", help="Press Escape after focusing to prompt Revit Idling.")
 
+    agent_task = sub.add_parser(
+        "agent-task",
+        help="Run one supported natural-language Revit QA task through guarded UI/API steps.",
+    )
+    agent_task.add_argument("--task", required=True, help="Plain-English Revit task request.")
+    agent_task.add_argument("--timeout", type=float, default=120.0)
+    agent_task.add_argument("--poll", type=float, default=1.0)
+    agent_task.add_argument("--expected-revit-version", default="")
+    agent_task.add_argument("--expected-title-contains", default="")
+    agent_task.add_argument("--expected-path-contains", default="")
+    agent_task.add_argument("--sheet-number", default="")
+    agent_task.add_argument("--no-screenshot", action="store_true")
+    agent_task.add_argument("--no-ui-tree", action="store_true")
+    agent_task.add_argument("--plan-only", action="store_true")
+
+    agent_session = sub.add_parser(
+        "agent-session-plan",
+        help="Plan a broad checkpointed Revit agent session without executing Revit actions.",
+    )
+    agent_session.add_argument("--objective", required=True, help="Plain-English Revit agent objective.")
+    agent_session.add_argument("--model", default="", help="Copied local RVT path for model-open choreography.")
+    agent_session.add_argument("--expected-revit-version", default="")
+    agent_session.add_argument("--expected-title-contains", default="")
+    agent_session.add_argument("--max-hours", type=float, default=4.0)
+    agent_session.add_argument("--parameters-json", default="{}", help="JSON object of workflow/model parameters.")
+
+    agent_session_run = sub.add_parser(
+        "agent-session-run",
+        help="Run only safe/read-only phases of a broad Revit agent session plan.",
+    )
+    agent_session_run.add_argument("--objective", required=True, help="Plain-English Revit agent objective.")
+    agent_session_run.add_argument("--model", default="", help="Copied local RVT path for model-open dry-run.")
+    agent_session_run.add_argument("--expected-revit-version", default="")
+    agent_session_run.add_argument("--expected-title-contains", default="")
+    agent_session_run.add_argument("--max-hours", type=float, default=4.0)
+    agent_session_run.add_argument("--parameters-json", default="{}", help="JSON object of workflow/model parameters.")
+    agent_session_run.add_argument("--no-open-dry-run", action="store_true")
+    agent_session_run.add_argument("--bridge-refresh-timeout", type=float, default=10.0)
+    agent_session_run.add_argument("--supervision-duration", type=float, default=0.0)
+    agent_session_run.add_argument("--supervision-poll", type=float, default=5.0)
+    agent_session_run.add_argument("--supervision-max-checks", type=int)
+
+    agent_ui_scout = sub.add_parser(
+        "agent-ui-flow-scout",
+        help="Observe current Revit UI and propose approval-gated candidates for an arbitrary UI objective.",
+    )
+    agent_ui_scout.add_argument("--objective", required=True, help="Plain-English Revit UI objective.")
+    agent_ui_scout.add_argument("--max-depth", type=int, default=4)
+    agent_ui_scout.add_argument("--limit", type=int, default=20)
+    agent_ui_scout.add_argument("--screenshot", action="store_true")
+    agent_ui_scout.add_argument("--include-uia", action="store_true")
+    agent_ui_scout.add_argument("--uia-limit", type=int, default=500)
+
+    agent_session_approval = sub.add_parser(
+        "agent-session-approval-plan",
+        help="Create a fresh approval packet for gated Revit agent session phases without executing them.",
+    )
+    agent_session_approval.add_argument("--objective", required=True, help="Plain-English Revit agent objective.")
+    agent_session_approval.add_argument("--model", default="")
+    agent_session_approval.add_argument("--expected-revit-version", default="")
+    agent_session_approval.add_argument("--expected-title-contains", default="")
+    agent_session_approval.add_argument("--max-hours", type=float, default=4.0)
+    agent_session_approval.add_argument(
+        "--parameters-json",
+        default="{}",
+        help="JSON object of workflow/model parameters.",
+    )
+
+    agent_session_execute = sub.add_parser(
+        "agent-session-execute-approved-item",
+        help="Dry-run or execute one item from private agent-session approval material.",
+    )
+    agent_session_execute.add_argument("--approval-material", required=True)
+    agent_session_execute.add_argument("--item-id", required=True)
+    agent_session_execute.add_argument("--execute", action="store_true")
+    agent_session_execute.add_argument(
+        "--confirmation",
+        default="",
+        help="Exact human phrase required when --execute is supplied: I approve <item-id>",
+    )
+    agent_session_execute.add_argument("--bridge-refresh-timeout", type=float, default=10.0)
+
     focus = sub.add_parser("focus", help="Focus Revit or a specific Revit window.")
     _add_action_flags(focus)
     focus.add_argument("--hwnd", type=int)
@@ -1015,6 +1105,11 @@ _STDOUT_REDACTED_APPROVAL_COMMANDS = {
     "north-star-current-handoff",
     "north-star-completion-gate",
     "north-star-unblock-readiness",
+    "agent-session-plan",
+    "agent-session-run",
+    "agent-ui-flow-scout",
+    "agent-session-approval-plan",
+    "agent-session-execute-approved-item",
 }
 _APPROVAL_TOKEN_RE = re.compile(r"\bAPPROVE:[A-Za-z0-9_.:-]+\b")
 
@@ -2005,6 +2100,104 @@ def dispatch(args: argparse.Namespace) -> dict:
                 focus_hwnd=args.focus_hwnd,
                 focus_approval_token=args.focus_approval_token,
                 idle_nudge=args.idle_nudge,
+            ),
+            "journal": journal.describe(),
+        }
+    elif command == "agent-task":
+        return {
+            **run_agent_task(
+                journal,
+                observer,
+                bridge,
+                task_text=args.task,
+                timeout=args.timeout,
+                poll=args.poll,
+                expected_revit_version=args.expected_revit_version,
+                expected_title_contains=args.expected_title_contains,
+                expected_path_contains=args.expected_path_contains,
+                sheet_number=args.sheet_number,
+                capture_screenshot=not args.no_screenshot,
+                capture_ui_tree=not args.no_ui_tree,
+                plan_only=args.plan_only,
+            ),
+            "journal": journal.describe(),
+        }
+    elif command == "agent-session-plan":
+        return {
+            **plan_agent_session(
+                journal,
+                objective=args.objective,
+                model_path=args.model,
+                expected_revit_version=args.expected_revit_version,
+                expected_title_contains=args.expected_title_contains,
+                max_hours=args.max_hours,
+                parameters=_json_object_arg(args.parameters_json, "parameters-json"),
+            ),
+            "journal": journal.describe(),
+        }
+    elif command == "agent-session-run":
+        return {
+            **run_agent_session(
+                journal,
+                observer,
+                bridge,
+                objective=args.objective,
+                model_path=args.model,
+                expected_revit_version=args.expected_revit_version,
+                expected_title_contains=args.expected_title_contains,
+                max_hours=args.max_hours,
+                parameters=_json_object_arg(args.parameters_json, "parameters-json"),
+                run_open_dry_run=not args.no_open_dry_run,
+                bridge_refresh_timeout=args.bridge_refresh_timeout,
+                supervision_duration=args.supervision_duration,
+                supervision_poll=args.supervision_poll,
+                supervision_max_checks=args.supervision_max_checks,
+            ),
+            "journal": journal.describe(),
+        }
+    elif command == "agent-ui-flow-scout":
+        return {
+            **scout_agent_ui_flow(
+                journal,
+                observer,
+                objective=args.objective,
+                max_depth=args.max_depth,
+                limit=args.limit,
+                capture_screenshot=args.screenshot,
+                include_uia=args.include_uia,
+                uia_limit=args.uia_limit,
+            ),
+            "journal": journal.describe(),
+        }
+    elif command == "agent-session-approval-plan":
+        return {
+            **build_agent_session_approval_plan(
+                journal,
+                objective=args.objective,
+                model_path=args.model,
+                expected_revit_version=args.expected_revit_version,
+                expected_title_contains=args.expected_title_contains,
+                max_hours=args.max_hours,
+                parameters=_json_object_arg(args.parameters_json, "parameters-json"),
+            ),
+            "journal": journal.describe(),
+        }
+    elif command == "agent-session-execute-approved-item":
+        return {
+            **execute_agent_session_approved_item(
+                journal,
+                observer,
+                bridge,
+                approval_material_path=Path(args.approval_material),
+                item_id=args.item_id,
+                execute=args.execute,
+                confirmation=args.confirmation,
+                bridge_refresh_timeout=args.bridge_refresh_timeout,
+                ui_command_runner=_ui_workflow_command_runner(
+                    sandbox,
+                    parent_task_id=journal.task_id,
+                    allow_sandbox_outside_safe_root=args.allow_sandbox_outside_safe_root,
+                ),
             ),
             "journal": journal.describe(),
         }

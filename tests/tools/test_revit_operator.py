@@ -12,6 +12,10 @@ import pytest
 
 from tools.revit_operator import cli, mcp_server
 from tools.revit_operator.actions import ActionRequest, SafeActionExecutor, validate_action_approval_matrix
+import tools.revit_operator.agent_session as agent_session
+from tools.revit_operator.agent_session import plan_agent_session, run_agent_session
+import tools.revit_operator.agent_task as agent_task
+from tools.revit_operator.agent_task import plan_agent_task, run_agent_task
 import tools.revit_operator.addin_installer as addin_installer
 from tools.revit_operator.addin_installer import addin_manifest_text
 from tools.revit_operator.addin_security import addin_security_preflight
@@ -34,6 +38,7 @@ import tools.revit_operator.north_star as north_star
 from tools.revit_operator.north_star import run_north_star_audit
 from tools.revit_operator.ocr import ocr_health, ocr_screenshot
 import tools.revit_operator.ocr as ocr_module
+import tools.revit_operator.operations as operations
 from tools.revit_operator.palettes import capture_properties_palette_snapshot
 from tools.revit_operator.project_browser import (
     capture_project_browser_snapshot,
@@ -55,6 +60,7 @@ from tools.revit_operator.server import (
     run_control_command,
 )
 from tools.revit_operator.safety import (
+    ALLOW,
     APPROVAL_REQUIRED,
     BLOCK,
     HIGH,
@@ -522,7 +528,8 @@ def test_cli_known_dialogs_lists_reusable_rules(tmp_path, capsys):
     )
 
     assert code == 0
-    output = json.loads(capsys.readouterr().out)
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
     assert output["success"] is True
     assert output["count"] >= 5
     assert any(rule["id"] == "transmitted-model" for rule in output["rules"])
@@ -553,7 +560,8 @@ def test_cli_records_and_uses_learned_dialog_rule(tmp_path, capsys):
     )
 
     assert code == 0
-    output = json.loads(capsys.readouterr().out)
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
     assert output["success"] is True
     assert Path(output["path"]).is_relative_to(tmp_path)
 
@@ -621,7 +629,8 @@ def test_cli_dialog_rule_library_lists_learned_rules(tmp_path, capsys):
     )
 
     assert code == 0
-    output = json.loads(capsys.readouterr().out)
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
     assert output["built_in_count"] >= 5
     assert output["learned_count"] == 1
     assert output["learned_rules"][0]["id"] == "custom"
@@ -783,7 +792,8 @@ def test_cli_dialog_workflows_lists_playbooks(tmp_path, capsys):
     )
 
     assert code == 0
-    output = json.loads(capsys.readouterr().out)
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
     assert output["success"] is True
     assert any(workflow["dialog_id"] == "transmitted-model" for workflow in output["workflows"])
     assert any(workflow["dialog_id"] == "manage-links" for workflow in output["workflows"])
@@ -19862,6 +19872,32 @@ def test_request_operation_execute_writes_bridge_queue_with_exact_token(tmp_path
     assert command["guards"]["allow_model_write"] is True
 
 
+def test_bridge_queue_append_retries_transient_permission_error(tmp_path, monkeypatch):
+    queue_path = tmp_path / "bridge" / "command_queue.jsonl"
+    queue_path.parent.mkdir()
+    original_open = Path.open
+    calls = {"count": 0}
+
+    def flaky_open(self, *args, **kwargs):
+        if self == queue_path and calls["count"] == 0:
+            calls["count"] += 1
+            raise PermissionError("bridge queue is temporarily locked")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", flaky_open)
+
+    result = operations._append_command_jsonl(
+        queue_path,
+        {"id": "retry-test", "operation": "active-document"},
+        attempts=2,
+        base_delay=0,
+    )
+
+    assert result["success"] is True
+    assert result["attempts"] == 2
+    assert json.loads(queue_path.read_text(encoding="utf-8"))["id"] == "retry-test"
+
+
 def test_request_operation_open_model_validates_and_queues_model_path(tmp_path, capsys):
     model = tmp_path / "bridge-open-R25.rvt"
     model.write_text("not a real model", encoding="utf-8")
@@ -22900,3 +22936,733 @@ def test_readonly_qa_workflow_runs_from_bridge_metadata(tmp_path, monkeypatch):
     assert result["metadata_path"].endswith(".json")
     assert result["qa_report_path"].endswith("qa_report.md")
     assert "23" not in "\n".join(result["findings"])
+
+
+def test_agent_task_plan_blocks_save_sync_and_model_changes():
+    result = plan_agent_task("Check warnings, then save and sync the central model")
+
+    assert result["success"] is True
+    assert result["decision"]["decision"] == BLOCK
+    assert "save" in result["blocked_intents"]
+    assert "sync" in result["blocked_intents"]
+
+
+def test_agent_task_plan_allows_readonly_qa_scope():
+    result = plan_agent_task(
+        "Inspect the copied structural drawings, check warnings and links, and produce a draft QA report",
+        expected_revit_version="2025",
+        expected_title_contains="detached",
+    )
+
+    assert result["decision"]["decision"] == ALLOW
+    assert result["task_type"] == "read_only_qa"
+    assert {"qa", "inspect", "warnings", "links", "report"}.issubset(set(result["supported_intents"]))
+
+
+def test_agent_task_stops_on_active_dialog_and_writes_human_packet(tmp_path, monkeypatch):
+    class FakeObserver:
+        def status(self):
+            return {
+                "state": "modal",
+                "active_dialogs": [{"title": "Upgrade Model"}],
+                "main_window": {"hwnd": 1},
+            }
+
+        def list_dialogs(self):
+            return {
+                "dialogs": [
+                    {
+                        "title": "Upgrade Model",
+                        "dialog_text": "This model must be upgraded.",
+                        "buttons": ["Upgrade", "Cancel"],
+                    }
+                ]
+            }
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("QA workflow must not run while a dialog is active.")
+
+    monkeypatch.setattr(agent_task, "run_readonly_qa_workflow", fail_if_called)
+
+    journal = TaskJournal(tmp_path, "agent-task-dialog-test")
+    result = run_agent_task(
+        journal,
+        FakeObserver(),
+        RevitBridgeClient(tmp_path),
+        task_text="Inspect sheets and produce a draft QA report",
+        expected_revit_version="2025",
+    )
+
+    assert result["status"] == "needs_human_approval"
+    assert result["task_complete"] is False
+    assert (journal.run_dir / "agent_task_human_packet.json").exists()
+    assert "Upgrade Model" in (journal.run_dir / "current_dialog_response_plan.json").read_text(encoding="utf-8")
+
+
+def test_agent_task_broad_approval_scope_writes_session_plan(tmp_path, monkeypatch):
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("QA workflow must not run for broad approval-gated objectives.")
+
+    monkeypatch.setattr(agent_task, "run_readonly_qa_workflow", fail_if_called)
+
+    journal = TaskJournal(tmp_path, "agent-task-session-plan-test")
+    result = run_agent_task(
+        journal,
+        RevitWindowObserver(),
+        RevitBridgeClient(tmp_path),
+        task_text="Open the copied model, use Manage Links, reload links if approved, and supervise for hours",
+        expected_revit_version="2025",
+    )
+
+    assert result["status"] == "needs_human_approval"
+    assert result["task_complete"] is False
+    assert result["session_plan"]["goal_complete"] is False
+    assert (journal.run_dir / "agent_session_plan.json").exists()
+    assert "APPROVE:" not in (journal.run_dir / "agent_session_plan.json").read_text(encoding="utf-8")
+
+
+def test_agent_task_runs_readonly_qa_after_readiness(tmp_path, monkeypatch):
+    class FakeObserver:
+        def __init__(self):
+            self.calls = 0
+
+        def status(self):
+            self.calls += 1
+            return {
+                "state": "idle",
+                "active_dialogs": [],
+                "main_window": {"hwnd": 1},
+                "revit_running": True,
+            }
+
+    def fake_wait_model_ready(journal, *_args, **_kwargs):
+        output = journal.run_dir / "model_ready_status.json"
+        output.write_text(json.dumps({"success": True, "ready": True, "path": str(output)}), encoding="utf-8")
+        return {"success": True, "ready": True, "path": str(output)}
+
+    def fake_workflow(journal, *_args, **_kwargs):
+        report = journal.run_dir / "qa_report.md"
+        report.write_text(DRAFT_LABEL, encoding="utf-8")
+        metadata = journal.metadata_dir / "metadata-test.json"
+        metadata.write_text("{}", encoding="utf-8")
+        return {
+            "success": True,
+            "workflow": "readonly-qa",
+            "qa_report_path": str(report),
+            "metadata_path": str(metadata),
+            "findings": ["1 Revit warning requires review."],
+            "output_files": [str(report), str(metadata)],
+        }
+
+    monkeypatch.setattr(agent_task, "wait_model_ready", fake_wait_model_ready)
+    monkeypatch.setattr(agent_task, "run_readonly_qa_workflow", fake_workflow)
+
+    journal = TaskJournal(tmp_path, "agent-task-run-test")
+    result = run_agent_task(
+        journal,
+        FakeObserver(),
+        RevitBridgeClient(tmp_path),
+        task_text="Inspect the structural drawings, check warnings, and produce a draft QA report",
+        expected_revit_version="2025",
+    )
+
+    assert result["status"] == "completed"
+    assert result["task_complete"] is True
+    assert result["may_tell_user_done"] is True
+    assert (journal.run_dir / "agent_task_plan.json").exists()
+    assert (journal.run_dir / "agent_task_report.md").exists()
+    assert "save_sync_publish_performed: `false`" in (journal.run_dir / "agent_task_report.md").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_cli_exposes_agent_task_command(tmp_path, capsys, monkeypatch):
+    class FakeObserver:
+        def status(self):
+            return {"state": "idle", "active_dialogs": [], "main_window": {"hwnd": 1}}
+
+    monkeypatch.setattr(cli, "RevitWindowObserver", lambda: FakeObserver())
+
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "agent-task-cli-test",
+            "agent-task",
+            "--task",
+            "Inspect warnings and produce a draft QA report",
+            "--plan-only",
+        ]
+    )
+
+    assert code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "planned"
+    assert output["task_complete"] is False
+    assert output["plan"]["task_type"] == "read_only_qa"
+
+
+def test_agent_session_plan_maps_general_agent_goal_and_refuses_completion(tmp_path):
+    journal = TaskJournal(tmp_path, "agent-session-plan-test")
+
+    result = plan_agent_session(
+        journal,
+        objective=(
+            "Open the copied model, handle upgrade and detach prompts, use Manage Links, "
+            "reload links with approval, update project info parameters, and supervise for hours."
+        ),
+        model_path=r"C:\safe\copied-local-R25.rvt",
+        expected_revit_version="2025",
+        expected_title_contains="detached",
+        max_hours=2,
+        parameters={
+            "parameter_name": "Project Status",
+            "parameter_value": "QA Draft",
+            "sheet_number": "S2.0",
+        },
+    )
+
+    requirement_ids = {row["id"] for row in result["requirements"]}
+    phase_ids = {row["id"] for row in result["phases"]}
+    workflow_names = {row["name"] for row in result["candidate_ui_workflows"]}
+    operation_names = {row["operation"] for row in result["model_change_requests"]}
+
+    assert result["success"] is True
+    assert result["goal_complete"] is False
+    assert result["may_call_update_goal"] is False
+    assert {
+        "arbitrary-ui-flows",
+        "approved-model-changing-work",
+        "model-open-prompt-choreography",
+        "multi-hour-task-planning",
+    }.issubset(requirement_ids)
+    assert "model-open-prompt-choreography" in phase_ids
+    assert "approved-model-changing-work" in phase_ids
+    assert "multi-hour-supervision" in phase_ids
+    assert "manage-links-inspection" in workflow_names
+    assert {"reload-links", "set-project-info-parameter"}.issubset(operation_names)
+    assert result["completion_blockers"]
+    assert (journal.run_dir / "agent_session_plan.json").exists()
+    assert (journal.run_dir / "agent_session_checklist.json").exists()
+    assert (journal.run_dir / "agent_session_plan.md").exists()
+    assert "APPROVE:" not in (journal.run_dir / "agent_session_plan.json").read_text(encoding="utf-8")
+
+
+def test_cli_exposes_agent_session_plan_command(tmp_path, capsys):
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "agent-session-cli-test",
+            "agent-session-plan",
+            "--objective",
+            "Use Review Warnings and Visibility/Graphics while supervising for hours.",
+            "--expected-revit-version",
+            "2025",
+            "--max-hours",
+            "1",
+        ]
+    )
+
+    assert code == 0
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
+    assert output["success"] is True
+    assert output["goal_complete"] is False
+    assert output["may_call_update_goal"] is False
+    workflow_names = {row["name"] for row in output["candidate_ui_workflows"]}
+    assert "review-warnings-inspection" in workflow_names
+    assert "visibility-graphics-inspection" in workflow_names
+    assert "APPROVE:" not in stdout
+
+
+def test_agent_session_run_executes_readonly_preflight_and_refuses_completion(tmp_path):
+    class FakeObserver:
+        def status(self):
+            return {
+                "state": "idle",
+                "active_dialogs": [],
+                "main_window": {"hwnd": 1, "title": "Autodesk Revit 2025"},
+                "revit_running": True,
+            }
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+    journal = TaskJournal(tmp_path, "agent-session-run-test")
+    result = run_agent_session(
+        journal,
+        FakeObserver(),
+        RevitBridgeClient(tmp_path),
+        objective="Use Manage Links and supervise for hours without unsafe writes.",
+        expected_revit_version="2025",
+        run_open_dry_run=False,
+        bridge_refresh_timeout=0,
+        supervision_duration=0,
+    )
+
+    step_names = {step["step"] for step in result["steps"]}
+    assert result["success"] is True
+    assert result["status"] == "stopped_at_approval_gates"
+    assert result["goal_complete"] is False
+    assert result["may_call_update_goal"] is False
+    assert {"observe-status", "list-dialogs", "bridge-status", "wait-model-ready-check"}.issubset(step_names)
+    assert (journal.run_dir / "agent_session_run.json").exists()
+    assert "APPROVE:" not in (journal.run_dir / "agent_session_run.json").read_text(encoding="utf-8")
+
+
+def test_agent_session_run_redacts_approval_tokens_from_open_model_dry_run(tmp_path, monkeypatch):
+    class FakeObserver:
+        def status(self):
+            return {
+                "state": "idle",
+                "active_dialogs": [],
+                "main_window": {"hwnd": 1, "title": "Autodesk Revit 2025"},
+                "revit_running": True,
+            }
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+    def fake_open_model(*_args, **_kwargs):
+        return {
+            "success": True,
+            "dry_run": True,
+            "policy": {"decision": APPROVAL_REQUIRED, "approval_token": "APPROVE:secret"},
+            "next_step": "Re-run with --approval-token APPROVE:secret",
+        }
+
+    monkeypatch.setattr(agent_session, "open_model", fake_open_model)
+
+    journal = TaskJournal(tmp_path, "agent-session-open-redaction-test")
+    result = run_agent_session(
+        journal,
+        FakeObserver(),
+        RevitBridgeClient(tmp_path),
+        objective="Open the copied model and handle prompts.",
+        model_path=str(tmp_path / "model-R25.rvt"),
+        expected_revit_version="2025",
+        bridge_refresh_timeout=0,
+        supervision_duration=0,
+    )
+
+    result_text = json.dumps(result)
+    artifact_text = (journal.run_dir / "agent_session_run.json").read_text(encoding="utf-8")
+    assert "APPROVE:secret" not in result_text
+    assert "APPROVE:secret" not in artifact_text
+    assert "<withheld approval token>" in artifact_text
+
+
+def test_cli_exposes_agent_session_run_command(tmp_path, capsys, monkeypatch):
+    class FakeObserver:
+        def status(self):
+            return {
+                "state": "idle",
+                "active_dialogs": [],
+                "main_window": {"hwnd": 1, "title": "Autodesk Revit 2025"},
+                "revit_running": True,
+            }
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+    monkeypatch.setattr(cli, "RevitWindowObserver", lambda: FakeObserver())
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "agent-session-run-cli-test",
+            "agent-session-run",
+            "--objective",
+            "Use Review Warnings and supervise for hours.",
+            "--expected-revit-version",
+            "2025",
+            "--no-open-dry-run",
+            "--bridge-refresh-timeout",
+            "0",
+            "--supervision-duration",
+            "0",
+        ]
+    )
+
+    assert code == 0
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
+    assert output["success"] is True
+    assert output["status"] == "stopped_at_approval_gates"
+    assert output["goal_complete"] is False
+    assert "APPROVE:" not in stdout
+
+
+def test_agent_session_approval_plan_keeps_tokens_private(tmp_path):
+    journal = TaskJournal(tmp_path, "agent-session-approval-plan-test")
+    result = agent_session.build_agent_session_approval_plan(
+        journal,
+        objective="Use Manage Links, reload links if approved, and update project info parameters.",
+        parameters={"parameter_name": "Project Status", "parameter_value": "QA Draft"},
+    )
+
+    public_text = (journal.run_dir / "agent_session_approval_plan.json").read_text(encoding="utf-8")
+    private_text = (journal.run_dir / "agent_session_approval_private_material.json").read_text(encoding="utf-8")
+
+    assert result["success"] is True
+    assert result["approval_required_count"] >= 2
+    assert result["private_material_contains_approval_tokens"] is True
+    assert "APPROVE:" not in json.dumps(result)
+    assert "APPROVE:" not in public_text
+    assert "APPROVE:" in private_text
+    assert "model-change:reload-links" in private_text
+
+
+def test_cli_exposes_agent_session_approval_plan_with_redacted_stdout(tmp_path, capsys):
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "agent-session-approval-cli-test",
+            "agent-session-approval-plan",
+            "--objective",
+            "Use Manage Links and reload links if approved.",
+        ]
+    )
+
+    assert code == 0
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
+    private_path = Path(output["private_material_path"])
+    assert output["success"] is True
+    assert output["approval_required_count"] >= 1
+    assert "APPROVE:" not in stdout
+    assert "APPROVE:" in private_path.read_text(encoding="utf-8")
+
+
+def test_agent_session_execute_approved_model_change_dry_run_redacts_tokens(tmp_path):
+    class FakeObserver:
+        def status(self):
+            return {
+                "state": "idle",
+                "active_dialogs": [],
+                "main_window": {"hwnd": 1, "title": "Autodesk Revit 2025"},
+                "revit_running": True,
+            }
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+    approval_journal = TaskJournal(tmp_path, "approval-source")
+    approval = agent_session.build_agent_session_approval_plan(
+        approval_journal,
+        objective="Reload links if approved.",
+    )
+    run_journal = TaskJournal(tmp_path, "approved-item-dry-run")
+    result = agent_session.execute_agent_session_approved_item(
+        run_journal,
+        FakeObserver(),
+        RevitBridgeClient(tmp_path),
+        approval_material_path=Path(approval["private_material_path"]),
+        item_id="model-change:reload-links",
+        execute=False,
+        bridge_refresh_timeout=0,
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "ready_for_approval_execution"
+    assert result["execution"]["executed"] is False
+    assert "APPROVE:" not in json.dumps(result)
+    assert "APPROVE:" not in (run_journal.run_dir / "agent_session_approved_item_result.json").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_agent_session_execute_approved_model_change_requires_exact_confirmation(tmp_path, monkeypatch):
+    class FakeObserver:
+        def status(self):
+            return {
+                "state": "idle",
+                "active_dialogs": [],
+                "main_window": {"hwnd": 1, "title": "Autodesk Revit 2025"},
+                "revit_running": True,
+            }
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+    approval_journal = TaskJournal(tmp_path, "approval-source-confirm")
+    approval = agent_session.build_agent_session_approval_plan(
+        approval_journal,
+        objective="Reload links if approved.",
+    )
+    calls = []
+
+    def fake_queue_operation(_journal, request):
+        calls.append(request)
+        return {
+            "success": True,
+            "dry_run": request.dry_run,
+            "command": {"operation": request.operation},
+        }
+
+    monkeypatch.setattr(agent_session, "queue_operation", fake_queue_operation)
+
+    wrong = agent_session.execute_agent_session_approved_item(
+        TaskJournal(tmp_path, "approved-item-wrong-confirm"),
+        FakeObserver(),
+        RevitBridgeClient(tmp_path),
+        approval_material_path=Path(approval["private_material_path"]),
+        item_id="model-change:reload-links",
+        execute=True,
+        confirmation="I approve the wrong thing",
+        bridge_refresh_timeout=0,
+    )
+    assert wrong["status"] == "stopped_confirmation_required"
+    assert all(call.operation == "active-document" for call in calls)
+
+    calls.clear()
+    executed = agent_session.execute_agent_session_approved_item(
+        TaskJournal(tmp_path, "approved-item-execute-confirm"),
+        FakeObserver(),
+        RevitBridgeClient(tmp_path),
+        approval_material_path=Path(approval["private_material_path"]),
+        item_id="model-change:reload-links",
+        execute=True,
+        confirmation="I approve model-change:reload-links",
+        bridge_refresh_timeout=0,
+    )
+    model_calls = [call for call in calls if call.operation == "reload-links"]
+    assert executed["status"] == "executed"
+    assert executed["execution"]["executed"] is True
+    assert model_calls
+    assert model_calls[-1].approval_token.startswith("APPROVE:")
+    assert "APPROVE:" not in json.dumps(executed)
+
+
+def test_cli_exposes_agent_session_execute_approved_item_dry_run(tmp_path, capsys, monkeypatch):
+    class FakeObserver:
+        def status(self):
+            return {
+                "state": "idle",
+                "active_dialogs": [],
+                "main_window": {"hwnd": 1, "title": "Autodesk Revit 2025"},
+                "revit_running": True,
+            }
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+    monkeypatch.setattr(cli, "RevitWindowObserver", lambda: FakeObserver())
+    approval = agent_session.build_agent_session_approval_plan(
+        TaskJournal(tmp_path, "approval-source-cli"),
+        objective="Reload links if approved.",
+    )
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "approved-item-cli-test",
+            "agent-session-execute-approved-item",
+            "--approval-material",
+            approval["private_material_path"],
+            "--item-id",
+            "model-change:reload-links",
+            "--bridge-refresh-timeout",
+            "0",
+        ]
+    )
+
+    assert code == 0
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
+    assert output["status"] == "ready_for_approval_execution"
+    assert output["execution"]["executed"] is False
+    assert "APPROVE:" not in stdout
+
+
+def _fake_agent_ui_tree():
+    return {
+        "supported": True,
+        "hwnd": 101,
+        "tree": {
+            "hwnd": 101,
+            "title": "Autodesk Revit 2025 - [Model]",
+            "class_name": "HwndWrapper[DefaultDomain;;test]",
+            "enabled": True,
+            "visible": True,
+            "children": [
+                {
+                    "hwnd": 201,
+                    "title": "Manage Links",
+                    "class_name": "Button",
+                    "enabled": True,
+                    "visible": True,
+                    "rect": {"left": 10, "top": 10, "right": 110, "bottom": 40},
+                    "children": [],
+                },
+                {
+                    "hwnd": 202,
+                    "title": "Review Warnings",
+                    "class_name": "Button",
+                    "enabled": True,
+                    "visible": True,
+                    "rect": {"left": 120, "top": 10, "right": 240, "bottom": 40},
+                    "children": [],
+                },
+            ],
+        },
+    }
+
+
+def test_agent_ui_flow_scout_finds_candidate_controls_without_execution(tmp_path):
+    class FakeObserver:
+        def status(self):
+            return {"state": "idle", "active_dialogs": [], "main_window": {"hwnd": 101}}
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+        def ui_tree(self, max_depth=4):
+            return _fake_agent_ui_tree()
+
+    journal = TaskJournal(tmp_path, "agent-ui-flow-scout-test")
+    result = agent_session.scout_agent_ui_flow(
+        journal,
+        FakeObserver(),
+        objective="Find Manage Links or Review Warnings in the current Revit UI.",
+    )
+
+    targets = {candidate["target"] for candidate in result["candidates"]}
+    assert result["success"] is True
+    assert result["status"] == "candidates_found"
+    assert result["read_only"] is True
+    assert result["ui_action_executed"] is False
+    assert {"Manage Links", "Review Warnings"}.issubset(targets)
+    assert all(action["recommended_action"] != "click" for action in result["next_actions"])
+    assert "APPROVE:" not in json.dumps(result)
+    assert (journal.run_dir / "agent_ui_flow_scout.json").exists()
+    assert (journal.run_dir / "agent_ui_flow_scout_ui_tree.json").exists()
+
+
+def test_agent_ui_flow_scout_can_include_uia_candidates(tmp_path):
+    class FakeObserver:
+        def status(self):
+            return {"state": "idle", "active_dialogs": [], "main_window": {"hwnd": 101}}
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+        def ui_tree(self, max_depth=4):
+            return {"supported": True, "hwnd": 101, "tree": {"name": "root", "children": []}}
+
+    def fake_uia_tree(**_kwargs):
+        return {
+            "success": True,
+            "supported": True,
+            "backend": "uia",
+            "hwnd": 101,
+            "node_count": 2,
+            "tree": {
+                "name": "Autodesk Revit",
+                "control_type": "Window",
+                "children": [
+                    {
+                        "name": "Manage Links",
+                        "control_type": "Button",
+                        "automation_id": "ID_MANAGE_LINKS",
+                        "class_name": "Button",
+                        "handle": 303,
+                        "enabled": True,
+                        "visible": True,
+                        "children": [],
+                    }
+                ],
+            },
+        }
+
+    journal = TaskJournal(tmp_path, "agent-ui-flow-uia-scout-test")
+    result = agent_session.scout_agent_ui_flow(
+        journal,
+        FakeObserver(),
+        objective="Find Manage Links.",
+        include_uia=True,
+        uia_tree_func=fake_uia_tree,
+    )
+
+    assert result["success"] is True
+    assert result["observation"]["uia_tree"]["success"] is True
+    assert result["candidates"][0]["source"] == "uia"
+    assert result["candidates"][0]["target"] == "Manage Links"
+    assert (journal.run_dir / "agent_ui_flow_scout_uia_tree.json").exists()
+
+
+def test_agent_ui_flow_scout_stops_on_modal_dialog(tmp_path):
+    class FakeObserver:
+        def status(self):
+            return {
+                "state": "modal",
+                "active_dialogs": [{"title": "Upgrade Model", "dialog_text": "This model will be upgraded."}],
+                "main_window": {"hwnd": 101},
+            }
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+        def ui_tree(self, max_depth=4):
+            return _fake_agent_ui_tree()
+
+    result = agent_session.scout_agent_ui_flow(
+        TaskJournal(tmp_path, "agent-ui-flow-modal-test"),
+        FakeObserver(),
+        objective="Find Manage Links.",
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "stopped_on_modal"
+    assert result["candidate_count"] == 0
+    assert result["next_actions"][0]["recommended_action"] == "plan-current-dialog-response"
+    assert result["next_actions"][0]["command"].startswith("plan-current-dialog-response")
+    assert result["ui_action_executed"] is False
+
+
+def test_cli_exposes_agent_ui_flow_scout_command(tmp_path, capsys, monkeypatch):
+    class FakeObserver:
+        def status(self):
+            return {"state": "idle", "active_dialogs": [], "main_window": {"hwnd": 101}}
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+        def ui_tree(self, max_depth=4):
+            return _fake_agent_ui_tree()
+
+    monkeypatch.setattr(cli, "RevitWindowObserver", lambda: FakeObserver())
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "agent-ui-flow-scout-cli-test",
+            "agent-ui-flow-scout",
+            "--objective",
+            "Find Manage Links in the current UI.",
+            "--max-depth",
+            "4",
+        ]
+    )
+
+    assert code == 0
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
+    assert output["success"] is True
+    assert output["status"] == "candidates_found"
+    assert output["candidate_count"] >= 1
+    assert "APPROVE:" not in stdout

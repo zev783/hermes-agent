@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -192,10 +193,13 @@ def queue_operation(journal: TaskJournal, request: OperationRequest) -> dict:
             result["error"] = error
         else:
             queue_path.parent.mkdir(parents=True, exist_ok=True)
-            with queue_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(command, sort_keys=True) + "\n")
-            result["success"] = True
-            result["queued"] = True
+            write_result = _append_command_jsonl(queue_path, command)
+            result["bridge_write"] = write_result
+            if write_result["success"]:
+                result["success"] = True
+                result["queued"] = True
+            else:
+                result["error"] = write_result["error"]
 
     journal.write_entry(
         {
@@ -211,6 +215,37 @@ def queue_operation(journal: TaskJournal, request: OperationRequest) -> dict:
         }
     )
     return result
+
+
+def _append_command_jsonl(
+    queue_path: Path,
+    command: dict,
+    *,
+    attempts: int = 8,
+    base_delay: float = 0.025,
+) -> dict:
+    line = json.dumps(command, sort_keys=True) + "\n"
+    last_error: OSError | None = None
+    for attempt in range(max(1, attempts)):
+        try:
+            with queue_path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+            return {
+                "success": True,
+                "attempts": attempt + 1,
+                "path": str(queue_path),
+            }
+        except OSError as exc:
+            last_error = exc
+            if attempt < attempts - 1:
+                time.sleep(min(0.4, base_delay * (2**attempt)))
+    return {
+        "success": False,
+        "attempts": max(1, attempts),
+        "path": str(queue_path),
+        "error": f"{type(last_error).__name__}: {last_error}",
+        "error_type": type(last_error).__name__ if last_error else "OSError",
+    }
 
 
 def _guard_operation(operation: str, request: OperationRequest) -> str | None:

@@ -23290,6 +23290,100 @@ def test_cli_exposes_agent_session_completion_audit_with_redacted_stdout(tmp_pat
     assert "APPROVE:cli-secret" not in stdout
 
 
+def test_agent_session_evidence_refresh_runs_readonly_collectors(tmp_path):
+    class FakeObserver:
+        def status(self):
+            return {
+                "state": "idle",
+                "active_dialogs": [],
+                "main_window": {"hwnd": 101, "title": "Autodesk Revit 2025"},
+                "revit_running": True,
+            }
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+        def ui_tree(self, max_depth=4):
+            return _fake_agent_ui_tree()
+
+    journal = TaskJournal(tmp_path, "agent-session-evidence-refresh-test")
+
+    result = agent_session.refresh_agent_session_evidence(
+        journal,
+        FakeObserver(),
+        RevitBridgeClient(tmp_path),
+        objective="Use Manage Links, reload links if approved, and supervise for hours.",
+        expected_revit_version="2025",
+        max_hours=1,
+        ui_limit=5,
+    )
+
+    step_ids = {step["id"] for step in result["steps"]}
+    assert result["success"] is True
+    assert result["read_only"] is True
+    assert result["status"] == "blocked_at_completion_gates"
+    assert result["goal_complete"] is False
+    assert result["may_call_update_goal"] is False
+    assert result["safety_summary"]["clicked_or_typed"] is False
+    assert result["safety_summary"]["model_write_performed"] is False
+    assert {
+        "agent-session-checkpoint",
+        "agent-session-resume-plan",
+        "agent-ui-flow-scout",
+        "agent-ui-flow-approval-plan",
+        "agent-session-approval-plan",
+        "supervision-endurance-audit",
+        "agent-session-completion-audit",
+    }.issubset(step_ids)
+    assert result["completion_audit"]["blocked_count"] > 0
+    assert "APPROVE:" not in json.dumps(result)
+    assert (journal.run_dir / "agent_session_evidence_refresh.json").exists()
+
+
+def test_cli_exposes_agent_session_evidence_refresh_with_redacted_stdout(tmp_path, capsys, monkeypatch):
+    class FakeObserver:
+        def status(self):
+            return {
+                "state": "idle",
+                "active_dialogs": [],
+                "main_window": {"hwnd": 101, "title": "Autodesk Revit 2025"},
+                "revit_running": True,
+            }
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+        def ui_tree(self, max_depth=4):
+            return _fake_agent_ui_tree()
+
+    monkeypatch.setattr(cli, "RevitWindowObserver", lambda: FakeObserver())
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "agent-session-evidence-refresh-cli-test",
+            "agent-session-evidence-refresh",
+            "--objective",
+            "Use Manage Links, reload links if approved, and supervise for hours.",
+            "--expected-revit-version",
+            "2025",
+            "--max-hours",
+            "1",
+        ]
+    )
+
+    assert code == 0
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
+    assert output["success"] is True
+    assert output["goal_complete"] is False
+    assert output["may_call_update_goal"] is False
+    assert output["safety_summary"]["commands_are_read_only"] is True
+    assert "APPROVE:" not in stdout
+
+
 def test_agent_session_run_executes_readonly_preflight_and_refuses_completion(tmp_path):
     class FakeObserver:
         def status(self):

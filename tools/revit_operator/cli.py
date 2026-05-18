@@ -17,6 +17,7 @@ from .agent_session import (
     execute_agent_session_approved_item,
     execute_ui_flow_approved_candidate,
     plan_agent_session,
+    refresh_agent_session_evidence,
     run_agent_session,
     scout_agent_ui_flow,
 )
@@ -1001,6 +1002,25 @@ def build_parser() -> argparse.ArgumentParser:
     agent_session_completion.add_argument("--max-artifacts", type=int, default=500)
     agent_session_completion.add_argument("--target-hours", type=float, default=4.0)
 
+    agent_session_refresh = sub.add_parser(
+        "agent-session-evidence-refresh",
+        help="Run all read-only evidence collectors for the broad Revit-agent goal and write a fresh completion audit.",
+    )
+    agent_session_refresh.add_argument(
+        "--objective",
+        default="",
+        help="Plain-English Revit agent objective; defaults to the current broad agent objective.",
+    )
+    agent_session_refresh.add_argument("--model", default="", help="Copied local RVT path for dry-run model-open choreography.")
+    agent_session_refresh.add_argument("--expected-revit-version", default="")
+    agent_session_refresh.add_argument("--expected-title-contains", default="")
+    agent_session_refresh.add_argument("--expected-path-contains", default="")
+    agent_session_refresh.add_argument("--max-hours", type=float, default=4.0)
+    agent_session_refresh.add_argument("--parameters-json", default="{}", help="JSON object of workflow/model parameters.")
+    agent_session_refresh.add_argument("--include-uia", action="store_true")
+    agent_session_refresh.add_argument("--ui-limit", type=int, default=20)
+    agent_session_refresh.add_argument("--max-artifacts", type=int, default=500)
+
     agent_ui_scout = sub.add_parser(
         "agent-ui-flow-scout",
         help="Observe current Revit UI and propose approval-gated candidates for an arbitrary UI objective.",
@@ -1201,6 +1221,7 @@ _STDOUT_REDACTED_APPROVAL_COMMANDS = {
     "agent-session-checkpoint",
     "agent-session-resume-plan",
     "agent-session-completion-audit",
+    "agent-session-evidence-refresh",
     "agent-ui-flow-scout",
     "agent-ui-flow-approval-plan",
     "agent-ui-flow-execute-approved-candidate",
@@ -2330,6 +2351,25 @@ def dispatch(args: argparse.Namespace) -> dict:
                 artifact_root=Path(args.artifact_root) if args.artifact_root else None,
                 max_artifacts=args.max_artifacts,
                 target_hours=args.target_hours,
+            ),
+            "journal": journal.describe(),
+        }
+    elif command == "agent-session-evidence-refresh":
+        return {
+            **refresh_agent_session_evidence(
+                journal,
+                observer,
+                bridge,
+                objective=args.objective,
+                model_path=args.model,
+                expected_revit_version=args.expected_revit_version,
+                expected_title_contains=args.expected_title_contains,
+                expected_path_contains=args.expected_path_contains,
+                max_hours=args.max_hours,
+                parameters=_json_object_arg(args.parameters_json, "parameters-json"),
+                include_uia=args.include_uia,
+                ui_limit=args.ui_limit,
+                max_artifacts=args.max_artifacts,
             ),
             "journal": journal.describe(),
         }

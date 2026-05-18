@@ -13,7 +13,8 @@ from .journal import TaskJournal, utc_now
 from .operations import OperationRequest, open_model, queue_operation
 from .readiness import wait_model_ready
 from .safety import APPROVAL_REQUIRED, BLOCK, classify_action, validate_output_path
-from .supervision import supervise_session
+from .session_checkpoint import build_agent_session_resume_plan, write_agent_session_checkpoint
+from .supervision import audit_supervision_endurance, supervise_session
 from .uia import uia_tree
 from .ui_workflows import UI_WORKFLOWS, run_ui_workflow
 from .windows import RevitWindowObserver
@@ -564,6 +565,222 @@ def build_agent_session_completion_audit(
                 "blocked_count": result["blocked_count"],
                 "goal_complete": goal_complete,
                 "may_call_update_goal": goal_complete,
+            },
+            "output_files": result["output_files"],
+        }
+    )
+    return sanitized
+
+
+def refresh_agent_session_evidence(
+    journal: TaskJournal,
+    observer: RevitWindowObserver,
+    bridge: RevitBridgeClient,
+    *,
+    objective: str = DEFAULT_AGENT_COMPLETION_OBJECTIVE,
+    model_path: str = "",
+    expected_revit_version: str = "",
+    expected_title_contains: str = "",
+    expected_path_contains: str = "",
+    max_hours: float = 4.0,
+    parameters: dict | None = None,
+    include_uia: bool = False,
+    ui_limit: int = 20,
+    max_artifacts: int = 500,
+) -> dict:
+    """Run all non-executing evidence collectors that can advance the agent goal."""
+
+    from .model_open_choreography import build_model_open_prompt_approval_plan, run_model_open_choreography
+
+    started_at = utc_now()
+    objective_text = " ".join(str(objective or DEFAULT_AGENT_COMPLETION_OBJECTIVE).split())
+    parameters = {str(key): str(value) for key, value in (parameters or {}).items()}
+    steps: list[dict] = []
+    output_files: list[str] = []
+
+    def add_step(step_id: str, result: dict) -> dict:
+        sanitized = _without_approval_tokens(result)
+        steps.append(
+            {
+                "id": step_id,
+                "status": sanitized.get("status") or sanitized.get("stop_reason"),
+                "success": sanitized.get("success"),
+                "read_only": sanitized.get("read_only", True),
+                "goal_complete": sanitized.get("goal_complete", False),
+                "may_call_update_goal": sanitized.get("may_call_update_goal", False),
+                "path": sanitized.get("path"),
+                "markdown_path": sanitized.get("markdown_path"),
+                "output_files": sanitized.get("output_files") or [
+                    value
+                    for key, value in sanitized.items()
+                    if key in {"path", "markdown_path", "private_material_path"} and isinstance(value, str)
+                ],
+            }
+        )
+        output_files.extend(value for value in steps[-1]["output_files"] if isinstance(value, str))
+        return sanitized
+
+    checkpoint = add_step(
+        "agent-session-checkpoint",
+        write_agent_session_checkpoint(
+            journal,
+            observer,
+            bridge,
+            objective=objective_text,
+            expected_revit_version=expected_revit_version,
+            expected_title_contains=expected_title_contains,
+            expected_path_contains=expected_path_contains,
+        ),
+    )
+    add_step(
+        "agent-session-resume-plan",
+        build_agent_session_resume_plan(
+            journal,
+            checkpoint_path=Path(checkpoint["path"]) if checkpoint.get("path") else None,
+            resume_minutes=max(1.0, min(max_hours * 60.0, 60.0)),
+        ),
+    )
+    scout = add_step(
+        "agent-ui-flow-scout",
+        scout_agent_ui_flow(
+            journal,
+            observer,
+            objective=objective_text,
+            limit=ui_limit,
+            include_uia=include_uia,
+        ),
+    )
+    if scout.get("path"):
+        add_step(
+            "agent-ui-flow-approval-plan",
+            build_ui_flow_candidate_approval_plan(
+                journal,
+                scout_path=Path(scout["path"]),
+                limit=ui_limit,
+            ),
+        )
+    add_step(
+        "agent-session-approval-plan",
+        build_agent_session_approval_plan(
+            journal,
+            objective=objective_text,
+            model_path=model_path,
+            expected_revit_version=expected_revit_version,
+            expected_title_contains=expected_title_contains,
+            max_hours=max_hours,
+            parameters=parameters,
+        ),
+    )
+    if model_path:
+        choreography = add_step(
+            "agent-model-open-choreography",
+            run_model_open_choreography(
+                journal,
+                observer,
+                bridge,
+                model_path=Path(model_path),
+                revit_version=expected_revit_version,
+                expected_title_contains=expected_title_contains,
+                expected_path_contains=expected_path_contains,
+                execute_open=False,
+                timeout=0,
+            ),
+        )
+        if choreography.get("path"):
+            add_step(
+                "agent-model-open-prompt-approval-plan",
+                build_model_open_prompt_approval_plan(
+                    journal,
+                    choreography_path=Path(choreography["path"]),
+                ),
+            )
+    else:
+        steps.append(
+            {
+                "id": "agent-model-open-choreography",
+                "status": "skipped_needs_model_path",
+                "success": True,
+                "read_only": True,
+                "goal_complete": False,
+                "may_call_update_goal": False,
+                "path": None,
+                "markdown_path": None,
+                "output_files": [],
+            }
+        )
+    add_step(
+        "supervision-endurance-audit",
+        audit_supervision_endurance(
+            journal,
+            target_hours=max_hours,
+            require_live_window=True,
+        ),
+    )
+    completion = add_step(
+        "agent-session-completion-audit",
+        build_agent_session_completion_audit(
+            journal,
+            objective=objective_text,
+            max_artifacts=max_artifacts,
+            target_hours=max_hours,
+        ),
+    )
+
+    result = {
+        "success": True,
+        "read_only": True,
+        "planned_only": True,
+        "label": DRAFT_LABEL,
+        "schema": "hermes-revit-agent-session-evidence-refresh/v1",
+        "created_at": started_at,
+        "finished_at": utc_now(),
+        "objective": objective_text,
+        "status": "blocked_at_completion_gates" if not completion.get("goal_complete") else "completion_ready",
+        "reason": (
+            "Read-only evidence was refreshed; approval/live-condition gates remain."
+            if not completion.get("goal_complete")
+            else "Read-only evidence refresh found all completion gates satisfied."
+        ),
+        "steps": steps,
+        "step_count": len(steps),
+        "completion_audit": {
+            "path": completion.get("path"),
+            "status": completion.get("status"),
+            "blocked_count": completion.get("blocked_count"),
+            "blocked_gates": completion.get("blocked_gates"),
+            "goal_complete": completion.get("goal_complete"),
+            "may_call_update_goal": completion.get("may_call_update_goal"),
+        },
+        "safety_summary": {
+            "clicked_or_typed": False,
+            "model_write_performed": False,
+            "save_sync_publish_performed": False,
+            "approval_required_actions_executed": False,
+            "commands_are_read_only": True,
+        },
+        "goal_complete": bool(completion.get("goal_complete")),
+        "may_call_update_goal": bool(completion.get("may_call_update_goal")),
+        "journal": journal.describe(),
+    }
+    output = journal.run_dir / "agent_session_evidence_refresh.json"
+    md_path = journal.run_dir / "agent_session_evidence_refresh.md"
+    result["path"] = str(output)
+    result["markdown_path"] = str(md_path)
+    result["output_files"] = _dedupe([*output_files, str(output), str(md_path)])
+    sanitized = _without_approval_tokens(result)
+    _write_json(output, journal.sandbox, sanitized)
+    _write_text(md_path, journal.sandbox, _evidence_refresh_markdown(sanitized))
+    journal.write_entry(
+        {
+            "command": "agent-session-evidence-refresh",
+            "requested_action": {"objective": objective_text},
+            "risk_classification": classify_action("agent-session-evidence-refresh", {}).to_dict(),
+            "approval_status": {"allowed": True, "reason": "Read-only evidence refresh only."},
+            "result": {
+                "status": result["status"],
+                "step_count": len(steps),
+                "goal_complete": result["goal_complete"],
+                "may_call_update_goal": result["may_call_update_goal"],
             },
             "output_files": result["output_files"],
         }
@@ -2385,6 +2602,7 @@ def _completion_hard_gates(artifacts: list[dict], *, target_hours: float) -> lis
 
 def _completion_next_commands(objective: str, *, target_hours: float) -> list[str]:
     return [
+        _command(["agent-session-evidence-refresh", "--objective", objective, "--target-hours", str(target_hours)]),
         _command(["agent-session-checkpoint", "--objective", objective]),
         _command(["agent-session-resume-plan", "--checkpoint", "<agent_session_checkpoint.json>"]),
         _command(["agent-ui-flow-scout", "--objective", objective, "--include-uia"]),
@@ -2768,6 +2986,7 @@ def _build_phases(
             "requires_approval": False,
             "purpose": "Keep a long-running task observable, resumable, and auditable.",
             "commands": [
+                _command(["agent-session-evidence-refresh", "--objective", objective_text]),
                 _command(["agent-session-checkpoint", "--objective", objective_text]),
                 _command(["agent-session-resume-plan", "--checkpoint", "<agent_session_checkpoint.json>"]),
                 f"supervise-session --duration {int(max(0.1, max_hours) * 3600)} --poll 30 --stop-on-modal",
@@ -2961,6 +3180,42 @@ def _completion_blockers(requirements: list[dict], checklist: list[dict]) -> lis
                 }
             )
     return blockers
+
+
+def _evidence_refresh_markdown(result: dict) -> str:
+    lines = [
+        "# Revit Agent Session Evidence Refresh",
+        "",
+        DRAFT_LABEL,
+        "",
+        f"Status: `{result.get('status')}`",
+        f"Goal complete: `{str(result.get('goal_complete')).lower()}`",
+        f"May call update_goal: `{str(result.get('may_call_update_goal')).lower()}`",
+        f"Reason: {result.get('reason')}",
+        "",
+        "## Steps",
+        "",
+    ]
+    for step in result.get("steps", []):
+        lines.append(
+            f"- `{step.get('id')}`: status=`{step.get('status')}` "
+            f"success=`{str(step.get('success')).lower()}`"
+        )
+    completion = result.get("completion_audit") if isinstance(result.get("completion_audit"), dict) else {}
+    lines.extend(
+        [
+            "",
+            "## Completion Audit",
+            "",
+            f"- status: `{completion.get('status')}`",
+            f"- blocked_count: `{completion.get('blocked_count')}`",
+            f"- path: `{completion.get('path')}`",
+        ]
+    )
+    lines.extend(["", "## Safety", ""])
+    for key, value in result.get("safety_summary", {}).items():
+        lines.append(f"- {key}: `{str(value).lower()}`")
+    return "\n".join(lines) + "\n"
 
 
 def _completion_audit_markdown(result: dict) -> str:

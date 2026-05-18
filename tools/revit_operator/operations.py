@@ -14,6 +14,7 @@ from .constants import SAFE_PROJECT_ROOT
 from .journal import TaskJournal, make_task_id, utc_now
 from .revit_locator import infer_revit_version_from_model, resolve_revit_exe
 from .safety import authorize, classify_action, validate_output_path
+from .version_support import validate_revit_version
 
 
 MODEL_WRITE_OPERATIONS = {
@@ -66,6 +67,10 @@ def open_model(
 
     inferred = infer_revit_version_from_model(model_path)
     requested_version = revit_version or inferred
+    version_error = None
+    if requested_version:
+        normalized_version, version_error = validate_revit_version(requested_version)
+        requested_version = normalized_version or requested_version
     exe = resolve_revit_exe(requested_version, revit_exe)
     payload = {
         "model_path": str(model_path),
@@ -100,7 +105,9 @@ def open_model(
             ],
         },
     }
-    if exe is None:
+    if version_error:
+        result["error"] = version_error
+    elif exe is None:
         result["error"] = f"Could not locate Revit executable for version {requested_version!r}."
     elif dry_run:
         result["success"] = True

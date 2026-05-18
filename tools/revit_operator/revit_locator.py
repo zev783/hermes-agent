@@ -6,6 +6,12 @@ import re
 from pathlib import Path
 
 from .constants import CURRENT_TEST_MODEL
+from .version_support import (
+    SUPPORTED_REVIT_VERSIONS,
+    default_revit_install_dir,
+    normalize_revit_version,
+    validate_revit_version,
+)
 
 
 DEFAULT_AUTODESK_ROOT = Path(r"C:\Program Files\Autodesk")
@@ -31,8 +37,9 @@ def installed_revit_versions(root: Path = DEFAULT_AUTODESK_ROOT) -> dict[str, st
     for child in root.glob("Revit 20??"):
         exe = child / "Revit.exe"
         if exe.exists():
-            version = child.name.rsplit(" ", 1)[-1]
-            versions[version] = str(exe)
+            version = normalize_revit_version(child.name.rsplit(" ", 1)[-1])
+            if version in SUPPORTED_REVIT_VERSIONS:
+                versions[version] = str(exe)
     return dict(sorted(versions.items()))
 
 
@@ -40,6 +47,14 @@ def resolve_revit_exe(version: str | None = None, explicit: str | None = None) -
     if explicit:
         path = Path(explicit)
         return path if path.exists() else None
+    if version:
+        normalized, error = validate_revit_version(version)
+        if error:
+            return None
+        default_exe = default_revit_install_dir(normalized) / "Revit.exe"
+        if default_exe.exists():
+            return default_exe
+        version = normalized
     versions = installed_revit_versions()
     if version and version in versions:
         return Path(versions[version])

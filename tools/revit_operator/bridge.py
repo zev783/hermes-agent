@@ -12,6 +12,11 @@ from .addin_installer import addin_source_dir, default_addins_root, default_asse
 from .constants import CURRENT_TEST_MODEL, DRAFT_LABEL
 from .journal import utc_now
 from .safety import validate_output_path
+from .version_support import (
+    SUPPORTED_REVIT_VERSIONS,
+    target_framework_for_revit_version,
+    validate_revit_version,
+)
 
 EXPECTED_BRIDGE_PROTOCOL_VERSION = "0.2"
 EXPECTED_SOURCE_CAPABILITY_STAMP = "continuous-idling-status-file-retry-v2"
@@ -51,7 +56,7 @@ class RevitBridgeClient:
             result["note"] = "No add-in status or heartbeat payload is present yet."
             result["expected_contract"] = {
                 "status": "started|stopped",
-                "revit_version": "2025",
+                "revit_version": "|".join(SUPPORTED_REVIT_VERSIONS),
                 "addin": {
                     "bridge_protocol_version": "string",
                     "supports_continuous_idling": True,
@@ -143,9 +148,10 @@ class RevitBridgeClient:
         addins_root: Path | None = None,
         assembly_path: Path | None = None,
     ) -> dict:
+        normalized_version, version_error = validate_revit_version(revit_version)
         addins_root = (addins_root or default_addins_root()).resolve()
-        assembly_path = (assembly_path or default_assembly_path()).resolve()
-        manifest_path = addins_root / revit_version / "HermesRevitOperator.addin"
+        assembly_path = (assembly_path or default_assembly_path(normalized_version)).resolve()
+        manifest_path = addins_root / (normalized_version or revit_version) / "HermesRevitOperator.addin"
         loaded = self.verify_loaded_build()
         manifest = _read_manifest_assembly(manifest_path)
         source_project = addin_source_dir() / "HermesRevitOperator.csproj"
@@ -155,6 +161,12 @@ class RevitBridgeClient:
             and _normalized_path_text(Path(str(manifest_assembly))) == _normalized_path_text(assembly_path)
         )
         checks = [
+            _readiness_check(
+                "revit_version_supported",
+                version_error is None,
+                f"Revit {normalized_version} is in the supported 2022-2027 range.",
+                version_error or "Unsupported Revit version.",
+            ),
             _readiness_check(
                 "source_project_present",
                 source_project.exists(),
@@ -196,6 +208,7 @@ class RevitBridgeClient:
         failed_checks = [check["name"] for check in checks if not check["passed"]]
         readiness_ok = all(check["passed"] for check in checks)
         next_steps = _bridge_readiness_next_steps(
+            revit_version=normalized_version or revit_version,
             assembly_exists=assembly_path.exists(),
             manifest_exists=manifest_path.exists(),
             manifest_points_to_assembly=manifest_points_to_assembly,
@@ -214,7 +227,11 @@ class RevitBridgeClient:
             "failed_check_count": len(failed_checks),
             "passed_checks": passed_checks,
             "failed_checks": failed_checks,
-            "revit_version": revit_version,
+            "revit_version": normalized_version or revit_version,
+            "target_framework": (
+                target_framework_for_revit_version(normalized_version) if version_error is None else None
+            ),
+            "supported_revit_versions": list(SUPPORTED_REVIT_VERSIONS),
             "paths": {
                 "addins_root": str(addins_root),
                 "manifest": str(manifest_path),
@@ -257,7 +274,7 @@ class RevitBridgeClient:
             "expected_contract": {
                 "document_title": "string",
                 "document_path": "string",
-                "revit_version": "2025",
+                "revit_version": "|".join(SUPPORTED_REVIT_VERSIONS),
                 "worksharing": "enabled|disabled|unknown",
                 "central_path": "string|null",
                 "dirty": "bool|null",
@@ -527,6 +544,7 @@ def _normalized_path_text(path: Path) -> str:
 
 def _bridge_readiness_next_steps(
     *,
+    revit_version: str,
     assembly_exists: bool,
     manifest_exists: bool,
     manifest_points_to_assembly: bool,
@@ -535,7 +553,7 @@ def _bridge_readiness_next_steps(
     steps: list[str] = []
     if not assembly_exists:
         steps.append(
-            "Build tools/revit_operator/addin/HermesRevitOperator.csproj for Revit 2025 before installing."
+            f"Build tools/revit_operator/addin/HermesRevitOperator.csproj for Revit {revit_version} before installing."
         )
     if not manifest_exists:
         steps.append("Run install-addin with explicit approval so Revit can find the DLL on next startup.")

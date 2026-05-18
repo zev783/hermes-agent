@@ -96,6 +96,7 @@ from .ui_workflows import (
     run_ui_workflow_smoke_matrix,
     validate_ui_workflow_matrix,
 )
+from .version_support import version_support_matrix
 from .uia import uia_control_details, uia_find_controls, uia_tree, validate_uia_method_matrix
 from .windows import RevitWindowObserver
 from .workflow_memory import (
@@ -126,6 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int, default=8765)
 
     sub.add_parser("health", help="Report operator dependencies and platform support.")
+    sub.add_parser("version-support", help="Report supported Revit versions and add-in target frameworks.")
     north_star_status = sub.add_parser(
         "north-star-status",
         help="Write a compact read-only north-star blocker/status handoff.",
@@ -1135,6 +1137,12 @@ def dispatch(args: argparse.Namespace) -> dict:
         result = observer.health()
         result["revit_installs"] = installed_revit_versions()
         result["default_test_model"] = default_test_model_info()
+    elif command == "version-support":
+        result = {
+            "success": True,
+            "read_only": True,
+            "support": version_support_matrix(installed_revit_versions()),
+        }
     elif command == "north-star-status":
         result = build_north_star_status(
             journal,

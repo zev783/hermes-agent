@@ -88,6 +88,12 @@ from tools.revit_operator.uia import (
     uia_tree,
     validate_uia_method_matrix,
 )
+from tools.revit_operator.version_support import (
+    REVIT_TARGET_FRAMEWORK_BY_VERSION,
+    SUPPORTED_REVIT_VERSIONS,
+    assembly_subdir_for_revit_version,
+    version_support_matrix,
+)
 from tools.revit_operator.windows import Rect, RevitWindowObserver, WindowInfo, find_controls_in_tree
 from tools.revit_operator.workflow_memory import plan_workflow_approvals, record_workflow, replay_workflow
 from tools.revit_operator.workflows import run_readonly_qa_workflow
@@ -17369,6 +17375,80 @@ def test_r25_filename_infers_revit_2025():
     assert infer_revit_version_from_model(Path("Example-Structural_Current-R25-BIM.rvt")) == "2025"
 
 
+@pytest.mark.parametrize(
+    ("marker", "version"),
+    [("R22", "2022"), ("R23", "2023"), ("R24", "2024"), ("R25", "2025"), ("R26", "2026"), ("R27", "2027")],
+)
+def test_revit_filename_markers_infer_supported_versions(marker, version):
+    assert infer_revit_version_from_model(Path(f"Example-Structural_Current-{marker}-BIM.rvt")) == version
+
+
+def test_revit_version_support_matrix_covers_2022_to_2027():
+    matrix = version_support_matrix({"2025": r"C:\Program Files\Autodesk\Revit 2025\Revit.exe"})
+
+    assert matrix["supported_versions"] == ["2022", "2023", "2024", "2025", "2026", "2027"]
+    assert matrix["min_version"] == "2022"
+    assert matrix["max_version"] == "2027"
+    assert matrix["version_count"] == 6
+    assert matrix["target_frameworks"] == {
+        "2022": "net48",
+        "2023": "net48",
+        "2024": "net48",
+        "2025": "net8.0-windows",
+        "2026": "net8.0-windows",
+        "2027": "net10.0-windows",
+    }
+    assert next(row for row in matrix["rows"] if row["revit_version"] == "2025")["installed"] is True
+
+
+def test_revit_addin_project_declares_all_supported_version_targets():
+    project = (
+        Path(__file__).resolve().parents[2]
+        / "tools"
+        / "revit_operator"
+        / "addin"
+        / "HermesRevitOperator.csproj"
+    ).read_text(encoding="utf-8")
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "tools"
+        / "revit_operator"
+        / "addin"
+        / "HermesRevitOperatorApp.cs"
+    ).read_text(encoding="utf-8")
+
+    assert "REVIT$(RevitVersion)" in project
+    for version in SUPPORTED_REVIT_VERSIONS:
+        assert version in project
+        assert f"REVIT{version}" in source
+    for framework in set(REVIT_TARGET_FRAMEWORK_BY_VERSION.values()):
+        assert framework in project
+    assert "System.Text.Json" in project
+    assert "ElementIdValue(ElementId id)" in source
+    assert "IntegerValue" in source
+    assert "supported_revit_versions" in source
+
+
+def test_cli_version_support_reports_all_supported_versions(tmp_path, capsys):
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "version-support-cli-test",
+            "version-support",
+        ]
+    )
+
+    assert code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["success"] is True
+    assert output["read_only"] is True
+    assert output["support"]["supported_versions"] == list(SUPPORTED_REVIT_VERSIONS)
+    assert output["support"]["target_frameworks"]["2027"] == "net10.0-windows"
+
+
 def test_sandbox_validation_defaults_to_known_safe_project(tmp_path):
     error = validate_sandbox_root(tmp_path, allow_outside_safe_root=False)
     assert error is not None
@@ -19834,6 +19914,54 @@ def test_install_addin_dry_run_reports_build_prerequisite(tmp_path, capsys):
     assert "NET SDK" in output["build_prerequisite"]
 
 
+@pytest.mark.parametrize("version", SUPPORTED_REVIT_VERSIONS)
+def test_install_addin_dry_run_supports_revit_2022_to_2027(tmp_path, capsys, version):
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path / "sandbox"),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            f"addin-test-{version}",
+            "install-addin",
+            "--revit-version",
+            version,
+            "--addins-root",
+            str(tmp_path / "Addins"),
+        ]
+    )
+
+    assert code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["success"] is True
+    assert output["dry_run"] is True
+    assert output["target_framework"] == REVIT_TARGET_FRAMEWORK_BY_VERSION[version]
+    assert f"Addins\\{version}\\HermesRevitOperator.addin" in output["target_manifest"]
+    assert str(assembly_subdir_for_revit_version(version)) in output["assembly_path"]
+
+
+def test_install_addin_rejects_unsupported_revit_version(tmp_path, capsys):
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path / "sandbox"),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "addin-unsupported-version-test",
+            "install-addin",
+            "--revit-version",
+            "2021",
+            "--addins-root",
+            str(tmp_path / "Addins"),
+        ]
+    )
+
+    assert code == 2
+    output = json.loads(capsys.readouterr().out)
+    assert output["success"] is False
+    assert "Unsupported Revit version" in output["error"]
+
+
 def test_default_assembly_path_prefers_newest_local_hermes_build(tmp_path, monkeypatch):
     monkeypatch.setattr(addin_installer, "addin_source_dir", lambda: tmp_path)
     legacy = tmp_path / "bin" / "Release" / "net8.0-windows" / "HermesRevitOperator.dll"
@@ -19854,6 +19982,22 @@ def test_default_assembly_path_prefers_newest_local_hermes_build(tmp_path, monke
     assert addin_installer.default_assembly_path() == current
     assert addin_installer.is_default_local_assembly_path(current) is True
     assert addin_installer.is_default_local_assembly_path(tmp_path / "other.dll") is False
+
+
+def test_default_assembly_path_prefers_version_specific_build(tmp_path, monkeypatch):
+    monkeypatch.setattr(addin_installer, "addin_source_dir", lambda: tmp_path)
+    versioned = tmp_path / assembly_subdir_for_revit_version("2024") / "HermesRevitOperator.dll"
+    legacy = tmp_path / "bin" / "Release" / "net8.0-windows-current" / "HermesRevitOperator.dll"
+    versioned.parent.mkdir(parents=True)
+    legacy.parent.mkdir(parents=True)
+    versioned.write_bytes(b"versioned")
+    legacy.write_bytes(b"legacy")
+    os.utime(versioned, (1_770_000_000, 1_770_000_000))
+    os.utime(legacy, (1_770_000_100, 1_770_000_100))
+
+    assert addin_installer.default_assembly_path("2024") == versioned
+    assert versioned in addin_installer.default_assembly_candidates("2024")
+    assert addin_installer.is_default_local_assembly_path(versioned, "2024") is True
 
 
 def test_trust_addin_dry_run_reports_cert_store_impact(tmp_path, capsys):
@@ -19913,6 +20057,38 @@ def test_addin_security_preflight_verifies_expected_manifest_before_load(tmp_pat
     assert result["can_consider_always_load_after_human_approval"] is True
     assert result["allowed_dialog_button"] == "Always Load"
     assert "trust-addin" in result["recommended_action"]
+
+
+@pytest.mark.parametrize("version", SUPPORTED_REVIT_VERSIONS)
+def test_addin_security_preflight_accepts_supported_revit_versions(tmp_path, version):
+    addins_root = tmp_path / "Addins"
+    assembly = tmp_path / assembly_subdir_for_revit_version(version) / "HermesRevitOperator.dll"
+    assembly.parent.mkdir(parents=True)
+    assembly.write_bytes(b"test dll")
+    manifest = addins_root / version / "HermesRevitOperator.addin"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(addin_manifest_text(assembly), encoding="utf-8")
+
+    result = addin_security_preflight(
+        TaskJournal(tmp_path / "sandbox", f"addin-security-test-{version}"),
+        revit_version=version,
+        addins_root=addins_root,
+        assembly_path=assembly,
+        signature_probe=lambda path: {
+            "available": True,
+            "path": str(path),
+            "status": "NotSigned",
+            "status_message": "The file is not signed.",
+            "signer_subject": None,
+            "signer_thumbprint": None,
+        },
+    )
+
+    checks = {check["name"]: check["passed"] for check in result["checks"]}
+    assert checks["revit_version_supported"] is True
+    assert result["revit_version"] == version
+    assert result["target_framework"] == REVIT_TARGET_FRAMEWORK_BY_VERSION[version]
+    assert result["expected_local_hermes_addin"] is True
 
 
 def test_addin_source_reports_loaded_build_and_continuous_idling_capabilities():
@@ -20310,6 +20486,43 @@ def test_bridge_readiness_requires_restart_when_installed_but_loaded_stale(tmp_p
     assert any("restart or reload Revit" in step for step in result["next_steps"])
 
 
+@pytest.mark.parametrize("version", SUPPORTED_REVIT_VERSIONS)
+def test_bridge_readiness_uses_revit_version_specific_manifest_and_framework(tmp_path, version):
+    bridge = RevitBridgeClient(tmp_path)
+    assembly = tmp_path / assembly_subdir_for_revit_version(version) / "HermesRevitOperator.dll"
+    assembly.parent.mkdir(parents=True)
+    assembly.write_bytes(b"fake-dll")
+    addins_root = tmp_path / "Addins"
+    manifest = addins_root / version / "HermesRevitOperator.addin"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(addin_manifest_text(assembly), encoding="utf-8")
+
+    result = bridge.bridge_readiness(
+        revit_version=version,
+        addins_root=addins_root,
+        assembly_path=assembly,
+    )
+
+    checks = {check["name"]: check["passed"] for check in result["checks"]}
+    assert checks["revit_version_supported"] is True
+    assert result["revit_version"] == version
+    assert result["target_framework"] == REVIT_TARGET_FRAMEWORK_BY_VERSION[version]
+    assert result["paths"]["manifest"].endswith(f"Addins\\{version}\\HermesRevitOperator.addin")
+    assert result["supported_revit_versions"] == list(SUPPORTED_REVIT_VERSIONS)
+
+
+def test_bridge_readiness_rejects_unsupported_revit_version(tmp_path):
+    bridge = RevitBridgeClient(tmp_path)
+
+    result = bridge.bridge_readiness(revit_version="2021", addins_root=tmp_path / "Addins")
+
+    assert result["success"] is False
+    assert result["target_framework"] is None
+    checks = {check["name"]: check for check in result["checks"]}
+    assert checks["revit_version_supported"]["passed"] is False
+    assert "Unsupported Revit version" in checks["revit_version_supported"]["reason"]
+
+
 def test_bridge_readiness_default_accepts_current_unlocked_build_path(tmp_path, monkeypatch):
     bridge = RevitBridgeClient(tmp_path)
     bridge.bridge_dir.mkdir()
@@ -20337,7 +20550,7 @@ def test_bridge_readiness_default_accepts_current_unlocked_build_path(tmp_path, 
     manifest = addins_root / "2025" / "HermesRevitOperator.addin"
     manifest.parent.mkdir(parents=True)
     manifest.write_text(addin_manifest_text(assembly), encoding="utf-8")
-    monkeypatch.setattr(bridge_module, "default_assembly_path", lambda: assembly)
+    monkeypatch.setattr(bridge_module, "default_assembly_path", lambda *_args: assembly)
 
     result = bridge.bridge_readiness(
         revit_version="2025",

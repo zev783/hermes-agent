@@ -13,6 +13,7 @@ from .addin_trust import CERT_SUBJECT
 from .bridge import _file_info, _normalized_path_text, _read_manifest_assembly
 from .journal import TaskJournal
 from .safety import classify_action
+from .version_support import target_framework_for_revit_version, validate_revit_version
 
 EXPECTED_ASSEMBLY_NAME = "HermesRevitOperator.dll"
 
@@ -29,9 +30,10 @@ def addin_security_preflight(
 ) -> dict:
     """Verify local Hermes add-in paths before an unsigned-add-in prompt is answered."""
 
+    normalized_version, version_error = validate_revit_version(revit_version)
     addins_root = (addins_root or default_addins_root()).resolve()
-    expected_assembly = (assembly_path or default_assembly_path()).resolve()
-    manifest_path = addins_root / revit_version / "HermesRevitOperator.addin"
+    expected_assembly = (assembly_path or default_assembly_path(normalized_version)).resolve()
+    manifest_path = addins_root / (normalized_version or revit_version) / "HermesRevitOperator.addin"
     manifest = _read_manifest_assembly(manifest_path)
     manifest_assembly_text = manifest.get("assembly_path")
     manifest_assembly = Path(str(manifest_assembly_text)).resolve() if manifest_assembly_text else None
@@ -48,6 +50,12 @@ def addin_security_preflight(
     signer_expected = expected_subject.casefold() in signer_subject.casefold() if signer_subject else False
 
     checks = [
+        _check(
+            "revit_version_supported",
+            version_error is None,
+            f"Revit {normalized_version} is in the supported 2022-2027 range.",
+            version_error or "Unsupported Revit version.",
+        ),
         _check(
             "manifest_present",
             manifest_path.exists(),
@@ -85,7 +93,7 @@ def addin_security_preflight(
             "DLL signer subject is missing or does not match the Hermes local code-signing certificate.",
         ),
     ]
-    expected_local_addin = all(
+    expected_local_addin = version_error is None and all(
         check["passed"]
         for check in checks
         if check["name"]
@@ -99,7 +107,7 @@ def addin_security_preflight(
     needs_trust_addin = expected_local_addin and not (signature_valid and signer_expected)
     can_consider_always_load = expected_local_addin
     payload = {
-        "revit_version": revit_version,
+        "revit_version": normalized_version or revit_version,
         "manifest": str(manifest_path),
         "expected_assembly": str(expected_assembly),
     }
@@ -109,7 +117,8 @@ def addin_security_preflight(
         "read_only": True,
         "status": "verified" if expected_local_addin and signature_valid and signer_expected else "needs_attention",
         "policy": decision.to_dict(),
-        "revit_version": revit_version,
+        "revit_version": normalized_version or revit_version,
+        "target_framework": target_framework_for_revit_version(normalized_version) if version_error is None else None,
         "paths": {
             "addins_root": str(addins_root),
             "manifest": str(manifest_path),

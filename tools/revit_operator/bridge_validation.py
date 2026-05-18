@@ -478,7 +478,7 @@ def _restart_no_save_checklist(
         "2. Do not run Save, Save As, Synchronize with Central, Publish, Relinquish, Reload Links, Detach, Upgrade, or any model-changing command.",
         "3. If Revit asks whether to save changes, Hermes must not answer. The human decides manually; do not save or sync from Hermes.",
         "4. Restart or reload Revit only when the human accepts the copied-model consequences.",
-        "5. Reopen only the safe copied Revit 2025 test model from the working-copy area.",
+        "5. Reopen only the safe copied local test model with the matching Revit version from the working-copy area.",
         "6. Treat any add-in, worksharing, link, warning, or save-changes prompt as high risk until re-observed and classified.",
         "",
         "## Post-Human Checks",

@@ -1,4 +1,5 @@
 param(
+    [ValidateSet("2022", "2023", "2024", "2025", "2026", "2027")]
     [string]$RevitVersion = "2025",
     [string]$AssemblyPath = "",
     [string]$AddinsRoot = "$env:APPDATA\Autodesk\Revit\Addins"
@@ -7,7 +8,15 @@ param(
 $ErrorActionPreference = "Stop"
 
 if (-not $AssemblyPath) {
-    $AssemblyPath = Join-Path $PSScriptRoot "bin\Release\net8.0-windows\HermesRevitOperator.dll"
+    $TargetFrameworkByVersion = @{
+        "2022" = "net48"
+        "2023" = "net48"
+        "2024" = "net48"
+        "2025" = "net8.0-windows"
+        "2026" = "net8.0-windows"
+        "2027" = "net10.0-windows"
+    }
+    $AssemblyPath = Join-Path $PSScriptRoot "bin\Release\$($TargetFrameworkByVersion[$RevitVersion])-r$RevitVersion\HermesRevitOperator.dll"
 }
 
 if (-not (Test-Path $AssemblyPath)) {

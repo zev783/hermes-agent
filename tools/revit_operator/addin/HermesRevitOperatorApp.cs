@@ -16,6 +16,28 @@ public class HermesRevitOperatorApp : IExternalApplication
 {
     private const string OperatorProtocolVersion = "0.2";
     private const string SourceCapabilityStamp = "continuous-idling-status-file-retry-v2";
+    private const string SupportedRevitVersions = "2022;2023;2024;2025;2026;2027";
+#if REVIT2022
+    private const string TargetRevitVersion = "2022";
+    private const string TargetFrameworkMoniker = "net48";
+#elif REVIT2023
+    private const string TargetRevitVersion = "2023";
+    private const string TargetFrameworkMoniker = "net48";
+#elif REVIT2024
+    private const string TargetRevitVersion = "2024";
+    private const string TargetFrameworkMoniker = "net48";
+#elif REVIT2025
+    private const string TargetRevitVersion = "2025";
+    private const string TargetFrameworkMoniker = "net8.0-windows";
+#elif REVIT2026
+    private const string TargetRevitVersion = "2026";
+    private const string TargetFrameworkMoniker = "net8.0-windows";
+#elif REVIT2027
+    private const string TargetRevitVersion = "2027";
+    private const string TargetFrameworkMoniker = "net10.0-windows";
+#else
+#error HermesRevitOperator requires REVIT2022, REVIT2023, REVIT2024, REVIT2025, REVIT2026, or REVIT2027.
+#endif
 
     private readonly HashSet<string> _processedCommandIds = new();
     private readonly string _sessionId = Guid.NewGuid().ToString("N");
@@ -347,7 +369,7 @@ public class HermesRevitOperatorApp : IExternalApplication
         var id = GetLong(opArgs, "id") ?? GetLong(opArgs, "view_id");
         if (id.HasValue)
         {
-            return doc.GetElement(new ElementId(id.Value)) as View;
+            return doc.GetElement(NewElementId(id.Value)) as View;
         }
 
         var sheetNumber = GetString(opArgs, "sheet_number");
@@ -376,7 +398,7 @@ public class HermesRevitOperatorApp : IExternalApplication
     {
         return new Dictionary<string, object?>
         {
-            ["id"] = view.Id.Value,
+            ["id"] = ElementIdValue(view.Id),
             ["name"] = view.Name,
             ["view_type"] = view.ViewType.ToString(),
             ["sheet_number"] = view is ViewSheet sheet ? sheet.SheetNumber : null
@@ -478,10 +500,10 @@ public class HermesRevitOperatorApp : IExternalApplication
             .Where(v => !v.IsTemplate)
             .Select(v => new Dictionary<string, object?>
             {
-                ["id"] = v.Id.Value,
+                ["id"] = ElementIdValue(v.Id),
                 ["name"] = v.Name,
                 ["view_type"] = v.ViewType.ToString(),
-                ["template_id"] = v.ViewTemplateId.Value
+                ["template_id"] = ElementIdValue(v.ViewTemplateId)
             })
             .ToList();
     }
@@ -493,7 +515,7 @@ public class HermesRevitOperatorApp : IExternalApplication
             .Cast<ViewSheet>()
             .Select(s => new Dictionary<string, object?>
             {
-                ["id"] = s.Id.Value,
+                ["id"] = ElementIdValue(s.Id),
                 ["sheet_number"] = s.SheetNumber,
                 ["name"] = s.Name,
                 ["is_placeholder"] = s.IsPlaceholder
@@ -508,7 +530,7 @@ public class HermesRevitOperatorApp : IExternalApplication
             .Cast<RevitLinkType>()
             .Select(l => new Dictionary<string, object?>
             {
-                ["id"] = l.Id.Value,
+                ["id"] = ElementIdValue(l.Id),
                 ["name"] = l.Name,
                 ["status"] = "unknown"
             })
@@ -522,7 +544,7 @@ public class HermesRevitOperatorApp : IExternalApplication
             {
                 ["description"] = w.GetDescriptionText(),
                 ["severity"] = w.GetSeverity().ToString(),
-                ["failing_element_ids"] = w.GetFailingElements().Select(id => id.Value).ToList()
+                ["failing_element_ids"] = w.GetFailingElements().Select(ElementIdValue).ToList()
             })
             .ToList();
     }
@@ -534,7 +556,7 @@ public class HermesRevitOperatorApp : IExternalApplication
             .Cast<Family>()
             .Select(f => new Dictionary<string, object?>
             {
-                ["id"] = f.Id.Value,
+                ["id"] = ElementIdValue(f.Id),
                 ["name"] = f.Name,
                 ["category"] = f.FamilyCategory?.Name
             })
@@ -547,7 +569,7 @@ public class HermesRevitOperatorApp : IExternalApplication
             .WhereElementIsElementType()
             .Select(e => new Dictionary<string, object?>
             {
-                ["id"] = e.Id.Value,
+                ["id"] = ElementIdValue(e.Id),
                 ["name"] = e.Name,
                 ["category"] = e.Category?.Name
             })
@@ -558,10 +580,28 @@ public class HermesRevitOperatorApp : IExternalApplication
     {
         return new Dictionary<string, object?>
         {
-            ["id"] = e.Id.Value,
+            ["id"] = ElementIdValue(e.Id),
             ["name"] = e.Name,
             ["category"] = e.Category?.Name
         };
+    }
+
+    private static long ElementIdValue(ElementId id)
+    {
+#if REVIT2022 || REVIT2023
+        return id.IntegerValue;
+#else
+        return id.Value;
+#endif
+    }
+
+    private static ElementId NewElementId(long value)
+    {
+#if REVIT2022 || REVIT2023
+        return new ElementId((int)value);
+#else
+        return new ElementId(value);
+#endif
     }
 
     private string? CentralPath(Document doc)
@@ -685,6 +725,9 @@ public class HermesRevitOperatorApp : IExternalApplication
             ["name"] = "Hermes Revit Operator",
             ["bridge_protocol_version"] = OperatorProtocolVersion,
             ["source_capability_stamp"] = SourceCapabilityStamp,
+            ["target_revit_version"] = TargetRevitVersion,
+            ["supported_revit_versions"] = SupportedRevitVersions,
+            ["target_framework"] = TargetFrameworkMoniker,
             ["supports_continuous_idling"] = true,
             ["uses_idling_set_raise_without_delay"] = true,
             ["loaded_at_utc"] = _loadedAtUtc.ToString("O"),

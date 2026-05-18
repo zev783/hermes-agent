@@ -1,16 +1,28 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <RevitVersion Condition="'$(RevitVersion)' == ''">2025</RevitVersion>
+    <TargetFramework Condition="'$(TargetFramework)' == '' and ('$(RevitVersion)' == '2022' or '$(RevitVersion)' == '2023' or '$(RevitVersion)' == '2024')">net48</TargetFramework>
+    <TargetFramework Condition="'$(TargetFramework)' == '' and ('$(RevitVersion)' == '2025' or '$(RevitVersion)' == '2026')">net8.0-windows</TargetFramework>
+    <TargetFramework Condition="'$(TargetFramework)' == '' and '$(RevitVersion)' == '2027'">net10.0-windows</TargetFramework>
+    <TargetFramework Condition="'$(TargetFramework)' == ''">net8.0-windows</TargetFramework>
     <UseWPF>false</UseWPF>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
     <AssemblyName>HermesRevitOperator</AssemblyName>
     <RootNamespace>Hermes.RevitOperator</RootNamespace>
+    <DefineConstants>$(DefineConstants);REVIT$(RevitVersion)</DefineConstants>
+    <OutputPath>bin\$(Configuration)\$(TargetFramework)-r$(RevitVersion)\</OutputPath>
+    <CopyLocalLockFileAssemblies Condition="'$(TargetFramework)' == 'net48'">true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
 
   <PropertyGroup>
-    <RevitInstallDir Condition="'$(RevitInstallDir)' == ''">C:\Program Files\Autodesk\Revit 2025</RevitInstallDir>
+    <RevitInstallDir Condition="'$(RevitInstallDir)' == ''">C:\Program Files\Autodesk\Revit $(RevitVersion)</RevitInstallDir>
   </PropertyGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'net48'">
+    <PackageReference Include="System.Text.Json" Version="8.0.5" />
+  </ItemGroup>
 
   <ItemGroup>
     <Reference Include="RevitAPI">
@@ -22,4 +34,9 @@
       <Private>false</Private>
     </Reference>
   </ItemGroup>
+
+  <Target Name="ValidateRevitVersion" BeforeTargets="BeforeBuild">
+    <Error Condition="'$(RevitVersion)' != '2022' and '$(RevitVersion)' != '2023' and '$(RevitVersion)' != '2024' and '$(RevitVersion)' != '2025' and '$(RevitVersion)' != '2026' and '$(RevitVersion)' != '2027'"
+           Text="HermesRevitOperator supports RevitVersion 2022, 2023, 2024, 2025, 2026, or 2027." />
+  </Target>
 </Project>

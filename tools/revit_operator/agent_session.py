@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .actions import ActionRequest, SafeActionExecutor
 from .bridge import RevitBridgeClient
-from .constants import DRAFT_LABEL
+from .constants import DRAFT_LABEL, SAFE_PROJECT_ROOT
 from .journal import TaskJournal, utc_now
 from .operations import OperationRequest, open_model, queue_operation
 from .readiness import wait_model_ready
@@ -165,6 +165,12 @@ UI_SCOUT_STOP_WORDS = {
     "with",
     "without",
 }
+
+
+DEFAULT_AGENT_COMPLETION_OBJECTIVE = (
+    "have revit autonomously handle arbitrary ui flows, approved model-changing work, "
+    "full model-open prompt choreography and multi-hour task planning"
+)
 
 
 def plan_agent_session(
@@ -450,6 +456,119 @@ def run_agent_session(
         }
     )
     return _without_approval_tokens(result)
+
+
+def build_agent_session_completion_audit(
+    journal: TaskJournal,
+    *,
+    objective: str = DEFAULT_AGENT_COMPLETION_OBJECTIVE,
+    artifact_root: Path | None = None,
+    max_artifacts: int = 500,
+    target_hours: float = 4.0,
+) -> dict:
+    """Audit current sandbox evidence against the broad Revit-agent objective."""
+
+    started_at = utc_now()
+    objective_text = " ".join(str(objective or DEFAULT_AGENT_COMPLETION_OBJECTIVE).split())
+    root = artifact_root or journal.sandbox
+    path_error = validate_output_path(root, journal.sandbox)
+    if path_error:
+        return {
+            "success": False,
+            "error": path_error,
+            "goal_complete": False,
+            "may_call_update_goal": False,
+            "completion_allowed": False,
+        }
+
+    audit_path = journal.run_dir / "agent_session_completion_audit.json"
+    md_path = journal.run_dir / "agent_session_completion_audit.md"
+    inventory = _completion_artifact_inventory(root, journal.sandbox, max_artifacts=max_artifacts)
+    artifacts = inventory.pop("_loaded_artifacts", [])
+    checklist = _completion_checklist(
+        artifacts,
+        audit_path=audit_path,
+        objective=objective_text,
+        target_hours=target_hours,
+    )
+    requirement_summaries = _completion_requirement_summaries(checklist)
+    hard_gates = _completion_hard_gates(artifacts, target_hours=target_hours)
+    blocked_items = [
+        {
+            "id": row["id"],
+            "requirement_id": row["requirement_id"],
+            "reason": row["gap"],
+        }
+        for row in checklist
+        if not row.get("satisfied")
+    ]
+    blocked_gates = [gate for gate in hard_gates if not gate.get("passed")]
+    goal_complete = not blocked_items and not blocked_gates
+    next_commands = _completion_next_commands(objective_text, target_hours=target_hours)
+    command_checks = [_completion_command_check(command) for command in next_commands]
+    result = {
+        "success": True,
+        "read_only": True,
+        "planned_only": True,
+        "label": DRAFT_LABEL,
+        "schema": "hermes-revit-agent-session-completion-audit/v1",
+        "created_at": started_at,
+        "objective": objective_text,
+        "concrete_deliverables": AGENT_REQUIREMENTS,
+        "artifact_root": str(root),
+        "artifact_inventory": inventory,
+        "prompt_to_artifact_checklist": checklist,
+        "requirement_summaries": requirement_summaries,
+        "hard_completion_gates": hard_gates,
+        "blocked_items": blocked_items,
+        "blocked_gates": blocked_gates,
+        "blocked_count": len(blocked_items) + len(blocked_gates),
+        "status": "complete" if goal_complete else "incomplete",
+        "reason": (
+            "Every strict Revit-agent completion criterion has current sandbox evidence."
+            if goal_complete
+            else "The objective is not complete; one or more live evidence gates are missing."
+        ),
+        "goal_complete": goal_complete,
+        "completion_allowed": goal_complete,
+        "may_call_update_goal": goal_complete,
+        "audit_rules": {
+            "proxy_signals_are_insufficient": True,
+            "tests_or_manifests_alone_do_not_authorize_completion": True,
+            "private_approval_material_is_not_copied_into_public_audit": True,
+            "uncertainty_counts_as_incomplete": True,
+        },
+        "next_recommended_commands": next_commands,
+        "next_command_checks": command_checks,
+        "next_commands_are_read_only": all(check["read_only"] for check in command_checks),
+        "path": str(audit_path),
+        "markdown_path": str(md_path),
+        "output_files": [str(audit_path), str(md_path)],
+        "journal": journal.describe(),
+    }
+    sanitized = _without_approval_tokens(result)
+    _write_json(audit_path, journal.sandbox, sanitized)
+    _write_text(md_path, journal.sandbox, _completion_audit_markdown(sanitized))
+    journal.write_entry(
+        {
+            "command": "agent-session-completion-audit",
+            "requested_action": {
+                "objective": objective_text,
+                "artifact_root": str(root),
+                "target_hours": target_hours,
+            },
+            "risk_classification": classify_action("agent-session-completion-audit", {}).to_dict(),
+            "approval_status": {"allowed": True, "reason": "Read-only completion evidence audit."},
+            "result": {
+                "status": result["status"],
+                "blocked_count": result["blocked_count"],
+                "goal_complete": goal_complete,
+                "may_call_update_goal": goal_complete,
+            },
+            "output_files": result["output_files"],
+        }
+    )
+    return sanitized
 
 
 def build_agent_session_approval_plan(
@@ -1857,6 +1976,675 @@ def _request_operation_command(operation: str, payload: dict) -> str:
     return _command(args)
 
 
+def _completion_artifact_inventory(root: Path, sandbox: Path, *, max_artifacts: int) -> dict:
+    root = Path(root)
+    loaded: list[dict] = []
+    skipped: list[dict] = []
+    summaries: list[dict] = []
+    if not root.exists():
+        return {
+            "root_exists": False,
+            "json_file_count": 0,
+            "loaded_count": 0,
+            "skipped_count": 0,
+            "schema_counts": {},
+            "artifacts": [],
+            "skipped": [],
+            "_loaded_artifacts": [],
+        }
+
+    candidates: list[tuple[float, int, Path]] = []
+    for path in root.rglob("*.json"):
+        try:
+            stat = path.stat()
+        except OSError as exc:
+            skipped.append(
+                {
+                    "path": str(path),
+                    "reason": f"stat failed: {type(exc).__name__}",
+                }
+            )
+            continue
+        candidates.append((stat.st_mtime, stat.st_size, path))
+    candidates.sort(reverse=True)
+
+    for _mtime, size, path in candidates[: max(0, max_artifacts)]:
+        if size > 2_000_000:
+            skipped.append(
+                {
+                    "path": str(path),
+                    "relative_path": _safe_relative_path(path, sandbox),
+                    "reason": "JSON artifact exceeded the 2 MB audit read limit.",
+                    "bytes": size,
+                }
+            )
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            skipped.append(
+                {
+                    "path": str(path),
+                    "relative_path": _safe_relative_path(path, sandbox),
+                    "reason": f"JSON parse failed: {type(exc).__name__}: {exc}",
+                    "bytes": size,
+                }
+            )
+            continue
+        if not isinstance(payload, dict):
+            skipped.append(
+                {
+                    "path": str(path),
+                    "relative_path": _safe_relative_path(path, sandbox),
+                    "reason": "JSON artifact was not an object.",
+                    "bytes": size,
+                }
+            )
+            continue
+        artifact = {
+            "path": path,
+            "payload": payload,
+            "schema": _completion_artifact_schema(path, payload),
+            "bytes": size,
+        }
+        loaded.append(artifact)
+        summaries.append(_completion_artifact_summary(artifact, sandbox))
+
+    schema_counts: dict[str, int] = {}
+    for artifact in loaded:
+        schema = artifact["schema"] or "<unknown>"
+        schema_counts[schema] = schema_counts.get(schema, 0) + 1
+    return {
+        "root_exists": True,
+        "json_file_count": len(candidates),
+        "loaded_count": len(loaded),
+        "max_artifacts": max_artifacts,
+        "truncated": len(candidates) > max_artifacts,
+        "skipped_count": len(skipped),
+        "schema_counts": dict(sorted(schema_counts.items())),
+        "artifacts": summaries,
+        "skipped": skipped[:50],
+        "_loaded_artifacts": loaded,
+    }
+
+
+def _completion_artifact_schema(path: Path, payload: dict) -> str:
+    schema = str(payload.get("schema") or "")
+    if schema:
+        return schema
+    name = path.name.lower()
+    if name == "model_ready_status.json":
+        return "hermes-revit-model-ready-status/v1"
+    if name == "supervision_log.json":
+        return "hermes-revit-supervision-log/v1"
+    if name == "supervision_endurance_audit.json":
+        return "hermes-revit-supervision-endurance-audit/v1"
+    if name == "supervision_endurance_matrix.json":
+        return "hermes-revit-supervision-endurance-matrix/v1"
+    if name.endswith("task_journal.jsonl"):
+        return "hermes-revit-task-journal/v1"
+    return ""
+
+
+def _completion_artifact_summary(artifact: dict, sandbox: Path) -> dict:
+    payload = artifact["payload"]
+    schema = artifact["schema"]
+    private = "approval-material" in schema
+    return {
+        "path": str(artifact["path"]),
+        "relative_path": _safe_relative_path(artifact["path"], sandbox),
+        "schema": schema,
+        "status": payload.get("status") or payload.get("stop_reason") or payload.get("checkpoint_status"),
+        "success": payload.get("success"),
+        "read_only": payload.get("read_only"),
+        "planned_only": payload.get("planned_only"),
+        "goal_complete": payload.get("goal_complete"),
+        "may_call_update_goal": payload.get("may_call_update_goal"),
+        "created_at": payload.get("created_at") or payload.get("started_at") or payload.get("audit_timestamp"),
+        "private_payload_withheld": private,
+        "signals": _completion_artifact_signals(artifact),
+        "bytes": artifact.get("bytes"),
+    }
+
+
+def _completion_artifact_signals(artifact: dict) -> dict:
+    payload = artifact["payload"]
+    receipt = payload.get("receipt") if isinstance(payload.get("receipt"), dict) else {}
+    execution = payload.get("execution") if isinstance(payload.get("execution"), dict) else {}
+    execution_receipt = execution.get("receipt") if isinstance(execution.get("receipt"), dict) else {}
+    return {
+        "approval_required_count": payload.get("approval_required_count"),
+        "blocked_count": payload.get("blocked_count"),
+        "prompt_event_count": len(payload.get("prompt_events") or []) if isinstance(payload.get("prompt_events"), list) else None,
+        "ready": payload.get("ready"),
+        "check_count": payload.get("check_count"),
+        "target_met": payload.get("target_met"),
+        "execute_requested": payload.get("execute_requested"),
+        "executed": execution.get("executed"),
+        "ui_action_executed": receipt.get("ui_action_executed"),
+        "model_write_guard": execution_receipt.get("model_write_guard"),
+        "post_action_refresh_success": execution_receipt.get("post_action_refresh_success"),
+    }
+
+
+def _completion_checklist(
+    artifacts: list[dict],
+    *,
+    audit_path: Path,
+    objective: str,
+    target_hours: float,
+) -> list[dict]:
+    rows: list[dict] = []
+    for requirement in AGENT_REQUIREMENTS:
+        for index, criterion in enumerate(requirement["success_criteria"], start=1):
+            evidence, gap = _completion_criterion_evidence(
+                artifacts,
+                requirement["id"],
+                index,
+                audit_path=audit_path,
+                objective=objective,
+                target_hours=target_hours,
+            )
+            rows.append(
+                {
+                    "id": f"{requirement['id']}:criterion-{index}",
+                    "requirement_id": requirement["id"],
+                    "requirement": requirement["requirement"],
+                    "criterion_index": index,
+                    "success_criterion": criterion,
+                    "satisfied": bool(evidence) and not gap,
+                    "evidence": evidence,
+                    "gap": gap,
+                }
+            )
+    return rows
+
+
+def _completion_criterion_evidence(
+    artifacts: list[dict],
+    requirement_id: str,
+    criterion_index: int,
+    *,
+    audit_path: Path,
+    objective: str,
+    target_hours: float,
+) -> tuple[list[dict], str]:
+    if requirement_id == "arbitrary-ui-flows":
+        if criterion_index == 1:
+            evidence = _artifact_evidence(
+                _artifacts_by_schema(artifacts, "hermes-revit-agent-ui-flow-scout/v1"),
+                "UI scout artifacts plan unknown UI work from observation without clicking.",
+            )
+            return evidence, "" if evidence else "No agent-ui-flow-scout artifact was found."
+        if criterion_index == 2:
+            evidence = [
+                {
+                    "source": "code",
+                    "path": "tools/revit_operator/ui_workflows.py",
+                    "reason": f"{len(UI_WORKFLOWS)} reusable UI workflow recipes are available.",
+                }
+            ] if UI_WORKFLOWS else []
+            evidence.extend(
+                _artifact_evidence(
+                    _artifacts_by_schema(artifacts, "hermes-revit-workflow-template/v1"),
+                    "Recorded workflow templates are available for replay planning.",
+                )
+            )
+            return evidence, "" if evidence else "No reusable UI workflow recipe or workflow template evidence was found."
+        if criterion_index == 3:
+            evidence = _artifact_evidence(
+                _executed_ui_artifacts(artifacts),
+                "Executed UI artifacts include fresh pre-action observation/preflight data.",
+            )
+            return evidence, "" if evidence else "No executed approval-gated UI artifact with fresh observation was found."
+        if criterion_index == 4:
+            evidence = _artifact_evidence(
+                _approved_executed_ui_artifacts(artifacts),
+                "UI execution required an exact approval phrase/token binding.",
+            )
+            return evidence, "" if evidence else "No executed UI action with exact approval confirmation evidence was found."
+        evidence = _artifact_evidence(
+            _ui_before_after_artifacts(artifacts),
+            "Executed UI artifact carries before/action-result evidence.",
+        )
+        return evidence, "" if evidence else "No executed UI artifact with before/action-result evidence was found."
+
+    if requirement_id == "approved-model-changing-work":
+        if criterion_index == 1:
+            evidence = _artifact_evidence(
+                _model_change_planning_artifacts(artifacts),
+                "Approval/session plans classify model-changing requests as approval-required or blocked.",
+            )
+            return evidence, "" if evidence else "No model-change approval planning artifact was found."
+        if criterion_index == 2:
+            evidence = _artifact_evidence(
+                _executed_model_change_artifacts(artifacts, require_guard=True),
+                "Executed model-change artifact includes allow-model-write/sync guard evidence.",
+            )
+            return evidence, "" if evidence else "No executed model-change artifact with write guards was found."
+        if criterion_index == 3:
+            evidence = _artifact_evidence(
+                _executed_model_change_artifacts(artifacts, require_bridge_queue=True),
+                "Executed model-change artifact queued work through the guarded bridge/API path.",
+            )
+            return evidence, "" if evidence else "No executed model-change bridge/API result was found."
+        if criterion_index == 4:
+            evidence = _artifact_evidence(
+                _executed_model_change_artifacts(artifacts, require_post_document=True),
+                "Executed model-change artifact includes payload/result and post-action document refresh.",
+            )
+            return evidence, "" if evidence else "No executed model-change receipt with final model state was found."
+        unsafe = _unsafe_write_signal_artifacts(artifacts)
+        if unsafe:
+            return _artifact_evidence(unsafe, "Unsafe write signal found."), "One or more artifacts report unsafe save/sync/publish/delete behavior."
+        return [
+            {
+                "source": "audit-scan",
+                "path": str(audit_path),
+                "reason": "No save/sync/publish/production-write signal was found in loaded artifacts.",
+            }
+        ], ""
+
+    if requirement_id == "model-open-prompt-choreography":
+        if criterion_index == 1:
+            evidence = _artifact_evidence(
+                _model_open_version_artifacts(artifacts),
+                "Model-open choreography includes an expected Revit version.",
+            )
+            return evidence, "" if evidence else "No model-open choreography artifact with Revit version evidence was found."
+        if criterion_index == 2:
+            evidence = _artifact_evidence(
+                _safe_local_model_open_artifacts(artifacts),
+                "Model-open artifact references a copied local model under the safe project root.",
+            )
+            return evidence, "" if evidence else "No model-open artifact proves the model path is under the safe copied project root."
+        if criterion_index == 3:
+            evidence = _artifact_evidence(
+                _prompt_event_artifacts(artifacts),
+                "Model-open choreography observed startup/open prompt events.",
+            )
+            return evidence, "" if evidence else "No live model-open/startup prompt event artifact was found."
+        if criterion_index == 4:
+            evidence = _artifact_evidence(
+                _classified_prompt_artifacts(artifacts),
+                "Prompt artifacts include classifier/approval-plan decisions.",
+            )
+            return evidence, "" if evidence else "No prompt classifier/approval-plan artifact for model-open prompts was found."
+        evidence = _artifact_evidence(
+            _model_ready_artifacts(artifacts),
+            "Model readiness/active-document verification succeeded after open.",
+        )
+        return evidence, "" if evidence else "No model-ready or active-document verification artifact was found."
+
+    if requirement_id == "multi-hour-task-planning":
+        if criterion_index == 1:
+            required = [
+                ("hermes-revit-agent-session-plan/v1", "session plan"),
+                ("hermes-revit-agent-session-checkpoint/v1", "checkpoint"),
+                ("hermes-revit-agent-session-resume-plan/v1", "resume plan"),
+            ]
+            evidence = []
+            missing = []
+            for schema, label in required:
+                found = _artifacts_by_schema(artifacts, schema)
+                if found:
+                    evidence.extend(_artifact_evidence(found[:1], f"Found {label} evidence."))
+                else:
+                    missing.append(label)
+            return evidence, "" if not missing else "Missing " + ", ".join(missing) + " artifact evidence."
+        if criterion_index == 2:
+            evidence = _artifact_evidence(
+                _supervision_log_artifacts(artifacts),
+                "Supervision logs contain periodic read-only observations.",
+            )
+            return evidence, "" if evidence else "No live supervision log with periodic observations was found."
+        if criterion_index == 3:
+            evidence = _artifact_evidence(
+                _supervision_stop_gate_artifacts(artifacts),
+                "Supervision artifacts demonstrate stop-on-modal/stall/unknown-state behavior.",
+            )
+            return evidence, "" if evidence else "No supervision stop/recovery matrix or live stop artifact was found."
+        if criterion_index == 4:
+            return [
+                {
+                    "source": "current-audit",
+                    "path": str(audit_path),
+                    "reason": f"This audit maps the objective to concrete sandbox artifacts: {objective}",
+                }
+            ], ""
+        evidence = [
+            {
+                "source": "current-audit",
+                "path": str(audit_path),
+                "reason": "This audit sets goal_complete and may_call_update_goal from strict evidence gates only.",
+            }
+        ]
+        return evidence, ""
+
+    return [], "Unknown requirement criterion."
+
+
+def _completion_requirement_summaries(checklist: list[dict]) -> list[dict]:
+    summaries = []
+    for requirement in AGENT_REQUIREMENTS:
+        rows = [row for row in checklist if row["requirement_id"] == requirement["id"]]
+        satisfied = [row for row in rows if row.get("satisfied")]
+        summaries.append(
+            {
+                "id": requirement["id"],
+                "requirement": requirement["requirement"],
+                "satisfied": len(satisfied) == len(rows),
+                "satisfied_criteria": len(satisfied),
+                "total_criteria": len(rows),
+                "missing_criteria": [
+                    {
+                        "criterion_index": row["criterion_index"],
+                        "success_criterion": row["success_criterion"],
+                        "gap": row["gap"],
+                    }
+                    for row in rows
+                    if not row.get("satisfied")
+                ],
+            }
+        )
+    return summaries
+
+
+def _completion_hard_gates(artifacts: list[dict], *, target_hours: float) -> list[dict]:
+    gates = [
+        {
+            "id": "arbitrary-ui-live-execution",
+            "requirement_id": "arbitrary-ui-flows",
+            "passed": bool(_artifacts_by_schema(artifacts, "hermes-revit-agent-ui-flow-scout/v1"))
+            and bool(_approved_executed_ui_artifacts(artifacts)),
+            "reason": "Requires both a UI scout and an executed approved UI action artifact.",
+        },
+        {
+            "id": "approved-model-change-live-execution",
+            "requirement_id": "approved-model-changing-work",
+            "passed": bool(_executed_model_change_artifacts(artifacts, require_post_document=True)),
+            "reason": "Requires an executed approved model-change receipt with post-action document evidence.",
+        },
+        {
+            "id": "model-open-full-prompt-and-ready",
+            "requirement_id": "model-open-prompt-choreography",
+            "passed": bool(_prompt_event_artifacts(artifacts))
+            and bool(_classified_prompt_artifacts(artifacts))
+            and bool(_model_ready_artifacts(artifacts)),
+            "reason": "Requires prompt events, prompt classification/approval handling, and model-ready verification.",
+        },
+        {
+            "id": "multi-hour-live-supervision-target",
+            "requirement_id": "multi-hour-task-planning",
+            "passed": bool(_endurance_target_artifacts(artifacts, target_hours=target_hours)),
+            "reason": f"Requires a supervision-endurance-audit target_met artifact for at least {target_hours:g} hours.",
+        },
+    ]
+    return gates
+
+
+def _completion_next_commands(objective: str, *, target_hours: float) -> list[str]:
+    return [
+        _command(["agent-session-checkpoint", "--objective", objective]),
+        _command(["agent-session-resume-plan", "--checkpoint", "<agent_session_checkpoint.json>"]),
+        _command(["agent-ui-flow-scout", "--objective", objective, "--include-uia"]),
+        _command(["agent-ui-flow-approval-plan", "--scout", "<agent_ui_flow_scout.json>"]),
+        _command(
+            [
+                "agent-ui-flow-execute-approved-candidate",
+                "--approval-material",
+                "<agent_ui_flow_approval_private_material.json>",
+                "--item-id",
+                "<ui-candidate-id>",
+            ]
+        ),
+        _command(["agent-model-open-choreography", "--model", "<copied-local-model>", "--revit-version", "2025"]),
+        _command(["agent-model-open-prompt-approval-plan", "--choreography", "<model_open_choreography.json>"]),
+        _command(["agent-session-approval-plan", "--objective", objective]),
+        _command(["agent-session-execute-approved-item", "--approval-material", "<agent_session_approval_private_material.json>", "--item-id", "<approval-item-id>"]),
+        _command(["supervise-session", "--duration", str(int(max(0.1, target_hours) * 3600)), "--poll", "30", "--stop-on-modal"]),
+        _command(["supervision-endurance-audit", "--target-hours", str(target_hours)]),
+        _command(["agent-session-completion-audit", "--objective", objective]),
+    ]
+
+
+def _completion_command_check(command: str) -> dict:
+    return {
+        "command": command,
+        "contains_execute_flag": "--execute" in command,
+        "contains_approval_token": "APPROVE:" in command or "--approval-token" in command or "--approval-tokens-json" in command,
+        "read_only": "--execute" not in command and "APPROVE:" not in command and "--approval-token" not in command and "--approval-tokens-json" not in command,
+    }
+
+
+def _artifacts_by_schema(artifacts: list[dict], *schemas: str) -> list[dict]:
+    wanted = set(schemas)
+    return [artifact for artifact in artifacts if artifact.get("schema") in wanted]
+
+
+def _artifact_evidence(artifacts: list[dict], reason: str, *, limit: int = 5) -> list[dict]:
+    return [
+        {
+            "source": "artifact",
+            "path": str(artifact["path"]),
+            "schema": artifact.get("schema") or "",
+            "status": artifact["payload"].get("status")
+            or artifact["payload"].get("stop_reason")
+            or artifact["payload"].get("checkpoint_status"),
+            "reason": reason,
+        }
+        for artifact in artifacts[:limit]
+    ]
+
+
+def _executed_ui_artifacts(artifacts: list[dict]) -> list[dict]:
+    result = []
+    for artifact in artifacts:
+        payload = artifact["payload"]
+        schema = artifact.get("schema")
+        if schema == "hermes-revit-agent-ui-flow-approved-candidate/v1":
+            receipt = payload.get("receipt") if isinstance(payload.get("receipt"), dict) else {}
+            if payload.get("execute_requested") and receipt.get("ui_action_executed"):
+                result.append(artifact)
+        if schema == "hermes-revit-agent-session-approved-item/v1" and payload.get("item_kind") == "ui-workflow-step":
+            execution = payload.get("execution") if isinstance(payload.get("execution"), dict) else {}
+            if payload.get("execute_requested") and execution.get("executed"):
+                result.append(artifact)
+    return result
+
+
+def _approved_executed_ui_artifacts(artifacts: list[dict]) -> list[dict]:
+    result = []
+    for artifact in _executed_ui_artifacts(artifacts):
+        payload = artifact["payload"]
+        execution = payload.get("execution") if isinstance(payload.get("execution"), dict) else {}
+        receipt = payload.get("receipt") if isinstance(payload.get("receipt"), dict) else {}
+        if payload.get("confirmation_ok") or execution.get("confirmation_ok") or receipt.get("approval_bound_to_private_item"):
+            result.append(artifact)
+    return result
+
+
+def _ui_before_after_artifacts(artifacts: list[dict]) -> list[dict]:
+    result = []
+    for artifact in _executed_ui_artifacts(artifacts):
+        payload = artifact["payload"]
+        execution = payload.get("execution") if isinstance(payload.get("execution"), dict) else {}
+        if payload.get("pre_action_observation") and payload.get("action_result"):
+            result.append(artifact)
+        elif execution.get("workflow_result"):
+            result.append(artifact)
+    return result
+
+
+def _model_change_planning_artifacts(artifacts: list[dict]) -> list[dict]:
+    result = []
+    for artifact in artifacts:
+        payload = artifact["payload"]
+        schema = artifact.get("schema")
+        if schema == "hermes-revit-agent-session-approval-plan/v1" and (
+            payload.get("approval_required_count") or payload.get("blocked_count")
+        ):
+            result.append(artifact)
+        if schema == "hermes-revit-agent-session-plan/v1" and payload.get("model_change_requests"):
+            result.append(artifact)
+    return result
+
+
+def _executed_model_change_artifacts(
+    artifacts: list[dict],
+    *,
+    require_guard: bool = False,
+    require_bridge_queue: bool = False,
+    require_post_document: bool = False,
+) -> list[dict]:
+    result = []
+    for artifact in artifacts:
+        payload = artifact["payload"]
+        if artifact.get("schema") != "hermes-revit-agent-session-approved-item/v1":
+            continue
+        if payload.get("item_kind") != "model-change-operation" or not payload.get("execute_requested"):
+            continue
+        execution = payload.get("execution") if isinstance(payload.get("execution"), dict) else {}
+        receipt = execution.get("receipt") if isinstance(execution.get("receipt"), dict) else {}
+        if not execution.get("executed"):
+            continue
+        if require_guard and not receipt.get("model_write_guard"):
+            continue
+        if require_bridge_queue and not receipt.get("queued_operation"):
+            continue
+        if require_post_document and not (receipt.get("post_action_refresh_success") and execution.get("post_action_active_document")):
+            continue
+        result.append(artifact)
+    return result
+
+
+def _unsafe_write_signal_artifacts(artifacts: list[dict]) -> list[dict]:
+    unsafe = []
+    for artifact in artifacts:
+        payload = artifact["payload"]
+        if _nested_true_key(payload, {"save_sync_publish_performed", "production_write_performed"}):
+            unsafe.append(artifact)
+            continue
+        execution = payload.get("execution") if isinstance(payload.get("execution"), dict) else {}
+        receipt = execution.get("receipt") if isinstance(execution.get("receipt"), dict) else {}
+        operation = str(receipt.get("requested_operation") or receipt.get("queued_operation") or "").lower()
+        if execution.get("executed") and operation in {"save", "sync", "synchronize-with-central", "delete", "publish"}:
+            unsafe.append(artifact)
+    return unsafe
+
+
+def _model_open_version_artifacts(artifacts: list[dict]) -> list[dict]:
+    result = []
+    for artifact in _artifacts_by_schema(artifacts, "hermes-revit-model-open-choreography/v1"):
+        expectations = artifact["payload"].get("expectations") if isinstance(artifact["payload"].get("expectations"), dict) else {}
+        if expectations.get("expected_revit_version"):
+            result.append(artifact)
+    return result
+
+
+def _safe_local_model_open_artifacts(artifacts: list[dict]) -> list[dict]:
+    result = []
+    for artifact in _artifacts_by_schema(artifacts, "hermes-revit-model-open-choreography/v1"):
+        model_path = artifact["payload"].get("model_path")
+        if model_path and _path_is_under_safe_project_root(str(model_path)):
+            result.append(artifact)
+    return result
+
+
+def _prompt_event_artifacts(artifacts: list[dict]) -> list[dict]:
+    return [
+        artifact
+        for artifact in _artifacts_by_schema(artifacts, "hermes-revit-model-open-choreography/v1")
+        if isinstance(artifact["payload"].get("prompt_events"), list) and artifact["payload"].get("prompt_events")
+    ]
+
+
+def _classified_prompt_artifacts(artifacts: list[dict]) -> list[dict]:
+    result = []
+    for artifact in _prompt_event_artifacts(artifacts):
+        events = artifact["payload"].get("prompt_events") or []
+        if any(isinstance(event, dict) and event.get("plans") for event in events):
+            result.append(artifact)
+    result.extend(
+        artifact
+        for artifact in _artifacts_by_schema(artifacts, "hermes-revit-model-open-prompt-approval-plan/v1")
+        if artifact["payload"].get("approval_required_count") is not None or artifact["payload"].get("manual_required_count") is not None
+    )
+    return result
+
+
+def _model_ready_artifacts(artifacts: list[dict]) -> list[dict]:
+    result = []
+    for artifact in artifacts:
+        payload = artifact["payload"]
+        schema = artifact.get("schema")
+        if schema == "hermes-revit-model-ready-status/v1" and payload.get("ready"):
+            result.append(artifact)
+        elif schema == "hermes-revit-model-open-choreography/v1" and payload.get("status") == "model_ready":
+            result.append(artifact)
+    return result
+
+
+def _supervision_log_artifacts(artifacts: list[dict]) -> list[dict]:
+    return [
+        artifact
+        for artifact in _artifacts_by_schema(artifacts, "hermes-revit-supervision-log/v1")
+        if int(artifact["payload"].get("check_count") or 0) > 0
+    ]
+
+
+def _supervision_stop_gate_artifacts(artifacts: list[dict]) -> list[dict]:
+    result = [
+        artifact
+        for artifact in _artifacts_by_schema(artifacts, "hermes-revit-supervision-endurance-matrix/v1")
+        if artifact["payload"].get("success")
+    ]
+    result.extend(
+        artifact
+        for artifact in _artifacts_by_schema(artifacts, "hermes-revit-supervision-log/v1")
+        if str(artifact["payload"].get("stop_reason") or "")
+        in {"modal_state_detected", "stalled_state_detected", "unknown_state_detected"}
+    )
+    return result
+
+
+def _endurance_target_artifacts(artifacts: list[dict], *, target_hours: float) -> list[dict]:
+    result = []
+    for artifact in _artifacts_by_schema(artifacts, "hermes-revit-supervision-endurance-audit/v1"):
+        payload = artifact["payload"]
+        if payload.get("target_met") and float(payload.get("target_hours") or 0.0) >= target_hours:
+            result.append(artifact)
+    return result
+
+
+def _nested_true_key(value, names: set[str]) -> bool:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if str(key) in names and child is True:
+                return True
+            if _nested_true_key(child, names):
+                return True
+    if isinstance(value, list):
+        return any(_nested_true_key(child, names) for child in value)
+    return False
+
+
+def _path_is_under_safe_project_root(raw_path: str) -> bool:
+    try:
+        path = Path(raw_path).resolve(strict=False)
+        safe_root = SAFE_PROJECT_ROOT.resolve(strict=False)
+        return path == safe_root or path.is_relative_to(safe_root)
+    except Exception:
+        return False
+
+
+def _safe_relative_path(path: Path, root: Path) -> str:
+    try:
+        return str(path.resolve(strict=False).relative_to(root.resolve(strict=False)))
+    except Exception:
+        return str(path)
+
+
 def _build_phases(
     *,
     objective_text: str,
@@ -2007,7 +2795,7 @@ def _build_phases(
             "risk": "low",
             "requires_approval": False,
             "purpose": "Refuse done/complete until every requirement maps to current evidence.",
-            "commands": ["agent-session-plan", "north-star-completion-gate"],
+            "commands": ["agent-session-completion-audit"],
             "evidence_required": [
                 "all checklist rows satisfied",
                 "no blocker rows",
@@ -2173,6 +2961,46 @@ def _completion_blockers(requirements: list[dict], checklist: list[dict]) -> lis
                 }
             )
     return blockers
+
+
+def _completion_audit_markdown(result: dict) -> str:
+    lines = [
+        "# Revit Agent Session Completion Audit",
+        "",
+        DRAFT_LABEL,
+        "",
+        f"Status: `{result.get('status')}`",
+        f"Goal complete: `{str(result.get('goal_complete')).lower()}`",
+        f"May call update_goal: `{str(result.get('may_call_update_goal')).lower()}`",
+        f"Blocked count: `{result.get('blocked_count')}`",
+        f"Reason: {result.get('reason')}",
+        "",
+        "## Objective",
+        "",
+        result.get("objective") or "",
+        "",
+        "## Requirement Coverage",
+        "",
+    ]
+    for summary in result.get("requirement_summaries", []):
+        lines.append(
+            f"- `{summary.get('id')}`: satisfied=`{str(summary.get('satisfied')).lower()}` "
+            f"({summary.get('satisfied_criteria')}/{summary.get('total_criteria')})"
+        )
+    lines.extend(["", "## Hard Gates", ""])
+    for gate in result.get("hard_completion_gates", []):
+        lines.append(f"- `{gate.get('id')}`: passed=`{str(gate.get('passed')).lower()}` - {gate.get('reason')}")
+    lines.extend(["", "## Missing Evidence", ""])
+    for item in result.get("blocked_items", [])[:50]:
+        lines.append(f"- `{item.get('id')}`: {item.get('reason')}")
+    for gate in result.get("blocked_gates", []):
+        lines.append(f"- `{gate.get('id')}`: {gate.get('reason')}")
+    if not result.get("blocked_items") and not result.get("blocked_gates"):
+        lines.append("- None.")
+    lines.extend(["", "## Next Read-Only Commands", ""])
+    for command in result.get("next_recommended_commands", []):
+        lines.append(f"- `{command}`")
+    return "\n".join(lines) + "\n"
 
 
 def _plan_markdown(result: dict) -> str:

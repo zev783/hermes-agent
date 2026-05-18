@@ -12,6 +12,7 @@ from pathlib import Path
 from .actions import ActionRequest, SafeActionExecutor, validate_action_approval_matrix
 from .agent_session import (
     build_agent_session_approval_plan,
+    build_agent_session_completion_audit,
     build_ui_flow_candidate_approval_plan,
     execute_agent_session_approved_item,
     execute_ui_flow_approved_candidate,
@@ -987,6 +988,19 @@ def build_parser() -> argparse.ArgumentParser:
     agent_session_resume.add_argument("--supervision-log", default="")
     agent_session_resume.add_argument("--resume-minutes", type=float, default=30.0)
 
+    agent_session_completion = sub.add_parser(
+        "agent-session-completion-audit",
+        help="Audit current sandbox artifacts against the broad Revit-agent objective before any done/complete claim.",
+    )
+    agent_session_completion.add_argument(
+        "--objective",
+        default="",
+        help="Plain-English Revit agent objective; defaults to the current broad agent objective.",
+    )
+    agent_session_completion.add_argument("--artifact-root", default="")
+    agent_session_completion.add_argument("--max-artifacts", type=int, default=500)
+    agent_session_completion.add_argument("--target-hours", type=float, default=4.0)
+
     agent_ui_scout = sub.add_parser(
         "agent-ui-flow-scout",
         help="Observe current Revit UI and propose approval-gated candidates for an arbitrary UI objective.",
@@ -1186,6 +1200,7 @@ _STDOUT_REDACTED_APPROVAL_COMMANDS = {
     "agent-session-run",
     "agent-session-checkpoint",
     "agent-session-resume-plan",
+    "agent-session-completion-audit",
     "agent-ui-flow-scout",
     "agent-ui-flow-approval-plan",
     "agent-ui-flow-execute-approved-candidate",
@@ -2304,6 +2319,17 @@ def dispatch(args: argparse.Namespace) -> dict:
                 checkpoint_path=Path(args.checkpoint) if args.checkpoint else None,
                 supervision_log_path=Path(args.supervision_log) if args.supervision_log else None,
                 resume_minutes=args.resume_minutes,
+            ),
+            "journal": journal.describe(),
+        }
+    elif command == "agent-session-completion-audit":
+        return {
+            **build_agent_session_completion_audit(
+                journal,
+                objective=args.objective,
+                artifact_root=Path(args.artifact_root) if args.artifact_root else None,
+                max_artifacts=args.max_artifacts,
+                target_hours=args.target_hours,
             ),
             "journal": journal.describe(),
         }

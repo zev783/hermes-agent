@@ -23182,6 +23182,114 @@ def test_cli_exposes_agent_session_plan_command(tmp_path, capsys):
     assert "APPROVE:" not in stdout
 
 
+def test_agent_session_completion_audit_refuses_without_live_evidence(tmp_path):
+    journal = TaskJournal(tmp_path, "agent-session-completion-audit-empty-test")
+
+    result = agent_session.build_agent_session_completion_audit(
+        journal,
+        objective="have revit autonomously handle arbitrary ui flows and multi-hour task planning",
+    )
+
+    assert result["success"] is True
+    assert result["read_only"] is True
+    assert result["status"] == "incomplete"
+    assert result["goal_complete"] is False
+    assert result["completion_allowed"] is False
+    assert result["may_call_update_goal"] is False
+    assert result["blocked_count"] > 0
+    assert len(result["prompt_to_artifact_checklist"]) == sum(
+        len(requirement["success_criteria"]) for requirement in agent_session.AGENT_REQUIREMENTS
+    )
+    assert all("--execute" not in command for command in result["next_recommended_commands"])
+    assert all("APPROVE:" not in command for command in result["next_recommended_commands"])
+    assert result["next_commands_are_read_only"] is True
+    assert (journal.run_dir / "agent_session_completion_audit.json").exists()
+
+
+def test_agent_session_completion_audit_maps_artifacts_and_withholds_private_tokens(tmp_path):
+    run_dir = tmp_path / "revit_operator_runs" / "evidence"
+    run_dir.mkdir(parents=True)
+    (run_dir / "agent_ui_flow_scout.json").write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-agent-ui-flow-scout/v1",
+                "success": True,
+                "status": "candidates_ready",
+                "candidates": [{"target": "Manage Links"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "agent_ui_flow_approval_private_material.json").write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-agent-ui-flow-approval-material/v1",
+                "approval_items": [{"id": "candidate-1", "approval_token": "APPROVE:secret-token"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = agent_session.build_agent_session_completion_audit(
+        TaskJournal(tmp_path, "agent-session-completion-audit-token-test"),
+        objective="have revit autonomously handle arbitrary ui flows",
+    )
+
+    assert result["status"] == "incomplete"
+    scout_rows = [
+        row
+        for row in result["prompt_to_artifact_checklist"]
+        if row["id"] == "arbitrary-ui-flows:criterion-1"
+    ]
+    assert scout_rows and scout_rows[0]["satisfied"] is True
+    private_summaries = [
+        item
+        for item in result["artifact_inventory"]["artifacts"]
+        if item["schema"] == "hermes-revit-agent-ui-flow-approval-material/v1"
+    ]
+    assert private_summaries
+    assert private_summaries[0]["private_payload_withheld"] is True
+    result_text = json.dumps(result)
+    artifact_text = Path(result["path"]).read_text(encoding="utf-8")
+    assert "APPROVE:secret-token" not in result_text
+    assert "APPROVE:secret-token" not in artifact_text
+
+
+def test_cli_exposes_agent_session_completion_audit_with_redacted_stdout(tmp_path, capsys):
+    run_dir = tmp_path / "revit_operator_runs" / "cli-evidence"
+    run_dir.mkdir(parents=True)
+    (run_dir / "agent_session_approval_private_material.json").write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-agent-session-approval-material/v1",
+                "approval_items": [{"id": "reload-links", "approval_token": "APPROVE:cli-secret"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "agent-session-completion-audit-cli-test",
+            "agent-session-completion-audit",
+            "--objective",
+            "have revit autonomously handle arbitrary ui flows",
+        ]
+    )
+
+    assert code == 0
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
+    assert output["success"] is True
+    assert output["goal_complete"] is False
+    assert output["may_call_update_goal"] is False
+    assert "APPROVE:cli-secret" not in stdout
+
+
 def test_agent_session_run_executes_readonly_preflight_and_refuses_completion(tmp_path):
     class FakeObserver:
         def status(self):

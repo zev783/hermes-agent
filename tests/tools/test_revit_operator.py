@@ -23807,6 +23807,218 @@ def test_cli_exposes_agent_ui_flow_approval_plan_with_redacted_stdout(tmp_path, 
     assert "APPROVE:" in private_path.read_text(encoding="utf-8")
 
 
+def test_agent_ui_flow_execute_approved_candidate_dry_run_redacts_tokens(tmp_path):
+    class FakeObserver:
+        def status(self):
+            return {
+                "state": "idle",
+                "active_dialogs": [],
+                "main_window": {"hwnd": 101, "title": "Autodesk Revit 2025"},
+                "revit_running": True,
+            }
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+    source = TaskJournal(tmp_path, "agent-ui-flow-execute-source")
+    scout_path = source.run_dir / "agent_ui_flow_scout.json"
+    scout_path.write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-agent-ui-flow-scout/v1",
+                "status": "candidates_found",
+                "candidates": [
+                    {
+                        "target": "Manage Links",
+                        "source": "uia",
+                        "control_type": "Button",
+                        "automation_id": "ID_MANAGE_LINKS",
+                        "class_name": "Button",
+                        "matched_terms": ["manage"],
+                        "confidence": "medium",
+                        "path": "Autodesk Revit > Manage Links",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    approval = agent_session.build_ui_flow_candidate_approval_plan(
+        TaskJournal(tmp_path, "agent-ui-flow-execute-approval"),
+        scout_path=scout_path,
+    )
+
+    journal = TaskJournal(tmp_path, "agent-ui-flow-execute-dry-run")
+    result = agent_session.execute_ui_flow_approved_candidate(
+        journal,
+        FakeObserver(),
+        approval_material_path=Path(approval["private_material_path"]),
+        item_id="ui-candidate:0:manage-links",
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "ready_for_approval_execution"
+    assert result["action_result"]["status"] == "dry_run"
+    assert result["receipt"]["ui_action_executed"] is False
+    assert "APPROVE:" not in json.dumps(result)
+    assert "APPROVE:" not in (journal.run_dir / "agent_ui_flow_approved_candidate_result.json").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_agent_ui_flow_execute_approved_candidate_requires_exact_confirmation(tmp_path, monkeypatch):
+    class FakeObserver:
+        def status(self):
+            return {
+                "state": "idle",
+                "active_dialogs": [],
+                "main_window": {"hwnd": 101, "title": "Autodesk Revit 2025"},
+                "revit_running": True,
+            }
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+    source = TaskJournal(tmp_path, "agent-ui-flow-execute-confirm-source")
+    scout_path = source.run_dir / "agent_ui_flow_scout.json"
+    scout_path.write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-agent-ui-flow-scout/v1",
+                "status": "candidates_found",
+                "candidates": [
+                    {
+                        "target": "Manage Links",
+                        "source": "uia",
+                        "control_type": "Button",
+                        "automation_id": "ID_MANAGE_LINKS",
+                        "class_name": "Button",
+                        "matched_terms": ["manage"],
+                        "confidence": "medium",
+                        "path": "Autodesk Revit > Manage Links",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    approval = agent_session.build_ui_flow_candidate_approval_plan(
+        TaskJournal(tmp_path, "agent-ui-flow-execute-confirm-approval"),
+        scout_path=scout_path,
+    )
+    calls = []
+
+    class FakeExecutor:
+        def __init__(self, observer, journal):
+            self.observer = observer
+            self.journal = journal
+
+        def run(self, request):
+            calls.append(request)
+            return {
+                "status": "executed",
+                "executed": True,
+                "dry_run": request.dry_run,
+                "policy": {"approval_token": request.approval_token},
+                "authorization": {"allowed": True},
+            }
+
+    monkeypatch.setattr(agent_session, "SafeActionExecutor", FakeExecutor)
+    material_path = Path(approval["private_material_path"])
+
+    wrong = agent_session.execute_ui_flow_approved_candidate(
+        TaskJournal(tmp_path, "agent-ui-flow-execute-wrong-confirm"),
+        FakeObserver(),
+        approval_material_path=material_path,
+        item_id="ui-candidate:0:manage-links",
+        execute=True,
+        confirmation="I approve the wrong item",
+    )
+    assert wrong["status"] == "stopped_confirmation_required"
+    assert calls == []
+
+    executed = agent_session.execute_ui_flow_approved_candidate(
+        TaskJournal(tmp_path, "agent-ui-flow-execute-right-confirm"),
+        FakeObserver(),
+        approval_material_path=material_path,
+        item_id="ui-candidate:0:manage-links",
+        execute=True,
+        confirmation="I approve ui-candidate:0:manage-links",
+    )
+
+    assert executed["status"] == "executed"
+    assert executed["receipt"]["ui_action_executed"] is True
+    assert calls[-1].action == "uia-invoke"
+    assert calls[-1].dry_run is False
+    assert calls[-1].approval_token.startswith("APPROVE:")
+    assert "APPROVE:" not in json.dumps(executed)
+
+
+def test_cli_exposes_agent_ui_flow_execute_approved_candidate_dry_run(tmp_path, capsys, monkeypatch):
+    class FakeObserver:
+        def status(self):
+            return {
+                "state": "idle",
+                "active_dialogs": [],
+                "main_window": {"hwnd": 101, "title": "Autodesk Revit 2025"},
+                "revit_running": True,
+            }
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+    monkeypatch.setattr(cli, "RevitWindowObserver", lambda: FakeObserver())
+    source = TaskJournal(tmp_path, "agent-ui-flow-execute-cli-source")
+    scout_path = source.run_dir / "agent_ui_flow_scout.json"
+    scout_path.write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-agent-ui-flow-scout/v1",
+                "status": "candidates_found",
+                "candidates": [
+                    {
+                        "target": "Manage Links",
+                        "source": "uia",
+                        "control_type": "Button",
+                        "automation_id": "ID_MANAGE_LINKS",
+                        "class_name": "Button",
+                        "matched_terms": ["manage"],
+                        "confidence": "medium",
+                        "path": "Autodesk Revit > Manage Links",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    approval = agent_session.build_ui_flow_candidate_approval_plan(
+        TaskJournal(tmp_path, "agent-ui-flow-execute-cli-approval"),
+        scout_path=scout_path,
+    )
+
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "agent-ui-flow-execute-cli-test",
+            "agent-ui-flow-execute-approved-candidate",
+            "--approval-material",
+            approval["private_material_path"],
+            "--item-id",
+            "ui-candidate:0:manage-links",
+        ]
+    )
+
+    assert code == 0
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
+    assert output["status"] == "ready_for_approval_execution"
+    assert output["action_result"]["status"] == "dry_run"
+    assert "APPROVE:" not in stdout
+
+
 def test_model_open_choreography_dry_run_redacts_open_approval(tmp_path):
     class FakeObserver:
         def status(self):

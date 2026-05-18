@@ -6,6 +6,7 @@ import json
 import re
 from pathlib import Path
 
+from .actions import ActionRequest, SafeActionExecutor
 from .bridge import RevitBridgeClient
 from .constants import DRAFT_LABEL
 from .journal import TaskJournal, utc_now
@@ -951,6 +952,143 @@ def build_ui_flow_candidate_approval_plan(
     return _without_approval_tokens(public)
 
 
+def execute_ui_flow_approved_candidate(
+    journal: TaskJournal,
+    observer: RevitWindowObserver,
+    *,
+    approval_material_path: Path,
+    item_id: str,
+    execute: bool = False,
+    confirmation: str = "",
+) -> dict:
+    """Dry-run or execute one candidate from private UI scout approval material."""
+
+    started_at = utc_now()
+    path_error = validate_output_path(approval_material_path, journal.sandbox)
+    if path_error:
+        return {"success": False, "error": path_error, "goal_complete": False, "may_call_update_goal": False}
+    if not approval_material_path.exists():
+        return {
+            "success": False,
+            "error": f"Approval material not found: {approval_material_path}",
+            "goal_complete": False,
+            "may_call_update_goal": False,
+        }
+    try:
+        material = json.loads(approval_material_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return {
+            "success": False,
+            "error": f"Invalid approval material JSON: {exc}",
+            "goal_complete": False,
+            "may_call_update_goal": False,
+        }
+    item = _find_private_approval_item(material if isinstance(material, dict) else {}, item_id)
+    if item is None:
+        return {"success": False, "error": f"Approval item not found: {item_id}", "goal_complete": False}
+    if item.get("kind") != "ui-candidate-control":
+        return {
+            "success": False,
+            "error": f"Approval item is not a UI candidate control: {item.get('kind')}",
+            "goal_complete": False,
+        }
+
+    expected_confirmation = f"I approve {item_id}"
+    confirmation_ok = str(confirmation or "").strip() == expected_confirmation
+    pre_action_status = _observer_result(observer, "status")
+    pre_action_dialogs = _observer_result(observer, "list_dialogs")
+    active_dialogs = _visible_dialogs(pre_action_status, pre_action_dialogs)
+    has_modal = bool(active_dialogs) or pre_action_status.get("state") == "modal"
+    payload = _ui_candidate_action_payload(item)
+    action_result = None
+    if has_modal:
+        status = "stopped_on_modal"
+        reason = "Fresh observation found a modal dialog before approved UI candidate execution."
+    elif execute and not confirmation_ok:
+        status = "stopped_confirmation_required"
+        reason = "Execution requires the exact human confirmation phrase for this UI candidate."
+    else:
+        action_result = SafeActionExecutor(observer, journal).run(
+            ActionRequest(
+                action="uia-invoke",
+                payload=payload,
+                dry_run=not execute,
+                approval_token=str(item.get("approval_token") or ""),
+            )
+        )
+        if execute:
+            status = "executed" if action_result.get("executed") else "failed"
+            reason = (
+                "Approved UI candidate executed."
+                if action_result.get("executed")
+                else "Approved UI candidate execution failed or was blocked by verification."
+            )
+        else:
+            status = "ready_for_approval_execution"
+            reason = "Approved UI candidate dry-run completed; no UI action was executed."
+
+    result = {
+        "success": True,
+        "label": DRAFT_LABEL,
+        "schema": "hermes-revit-agent-ui-flow-approved-candidate/v1",
+        "started_at": started_at,
+        "finished_at": utc_now(),
+        "status": status,
+        "reason": reason,
+        "item_id": item_id,
+        "item_kind": item.get("kind"),
+        "target": item.get("target"),
+        "execute_requested": bool(execute),
+        "confirmation_required": bool(execute),
+        "confirmation_ok": confirmation_ok,
+        "expected_confirmation_phrase": expected_confirmation,
+        "pre_action_observation": {
+            "status": pre_action_status,
+            "dialogs": pre_action_dialogs,
+            "has_modal_dialog": has_modal,
+        },
+        "action_payload": payload,
+        "action_result": _without_approval_tokens(action_result) if action_result else None,
+        "receipt": {
+            "approval_bound_to_private_item": bool(item.get("approval_token")),
+            "private_material_schema": material.get("schema") if isinstance(material, dict) else None,
+            "source_scout_path": material.get("source_scout_path") if isinstance(material, dict) else None,
+            "ui_action_executed": bool(action_result and action_result.get("executed")),
+            "model_write_performed": False,
+            "save_sync_publish_performed": False,
+        },
+        "goal_complete": False,
+        "may_call_update_goal": False,
+        "journal": journal.describe(),
+    }
+    output = journal.run_dir / "agent_ui_flow_approved_candidate_result.json"
+    md_path = journal.run_dir / "agent_ui_flow_approved_candidate_result.md"
+    result["path"] = str(output)
+    result["markdown_path"] = str(md_path)
+    result["output_files"] = [str(output), str(md_path)]
+    sanitized = _without_approval_tokens(result)
+    _write_json(output, journal.sandbox, sanitized)
+    _write_text(md_path, journal.sandbox, _ui_flow_approved_candidate_markdown(sanitized))
+    journal.write_entry(
+        {
+            "command": "agent-ui-flow-execute-approved-candidate",
+            "requested_action": {"item_id": item_id, "execute": bool(execute)},
+            "risk_classification": _without_approval_tokens(classify_action("uia-invoke", payload).to_dict()),
+            "approval_status": {
+                "allowed": not execute or confirmation_ok,
+                "reason": "Exact confirmation supplied." if confirmation_ok else "Dry-run or missing confirmation.",
+            },
+            "result": {
+                "status": status,
+                "executed": bool(action_result and action_result.get("executed")),
+                "goal_complete": False,
+            },
+            "output_files": result["output_files"],
+        }
+    )
+    return sanitized
+
+
 def _observer_result(observer: RevitWindowObserver, method_name: str) -> dict:
     method = getattr(observer, method_name, None)
     if not callable(method):
@@ -1240,10 +1378,28 @@ def _ui_candidate_approval_item(index: int, candidate: dict) -> dict:
     token = str(policy_payload.get("approval_token") or "")
     private = {
         **public,
+        "action_payload": payload,
         "approval_token": token,
         "execute_command": _ui_candidate_execute_command(payload, token),
     }
     return {"blocked": False, "public": public, "private": private}
+
+
+def _ui_candidate_action_payload(item: dict) -> dict:
+    material_payload = item.get("action_payload")
+    if isinstance(material_payload, dict) and material_payload:
+        return dict(material_payload)
+    payload = {
+        "name": str(item.get("target") or ""),
+        "control_type": str(item.get("control_type") or ""),
+        "automation_id": str(item.get("automation_id") or ""),
+        "class_name": str(item.get("class_name") or ""),
+        "method": str(item.get("method") or "invoke"),
+        "exact": True,
+    }
+    if item.get("hwnd") is not None:
+        payload["hwnd"] = item.get("hwnd")
+    return payload
 
 
 def _ui_candidate_execute_command(payload: dict, approval_token: str) -> str:
@@ -1773,6 +1929,15 @@ def _build_phases(
                 "commands": [
                     _command(["agent-ui-flow-scout", "--objective", objective_text]),
                     _command(["agent-ui-flow-approval-plan", "--scout", "<agent_ui_flow_scout.json>"]),
+                    _command(
+                        [
+                            "agent-ui-flow-execute-approved-candidate",
+                            "--approval-material",
+                            "<agent_ui_flow_approval_private_material.json>",
+                            "--item-id",
+                            "<ui-candidate-id>",
+                        ]
+                    ),
                     *[wf["plan_command"] for wf in candidate_workflows],
                 ],
                 "candidate_workflows": [
@@ -2150,6 +2315,29 @@ def _ui_flow_approval_plan_markdown(result: dict) -> str:
         lines.append(f"- `{item.get('id')}`: {item.get('target')} ({item.get('reason')})")
     if not result.get("blocked_items"):
         lines.append("- None.")
+    return "\n".join(lines) + "\n"
+
+
+def _ui_flow_approved_candidate_markdown(result: dict) -> str:
+    lines = [
+        "# Revit Agent UI Flow Approved Candidate Result",
+        "",
+        DRAFT_LABEL,
+        "",
+        f"Status: `{result.get('status')}`",
+        f"Item: `{result.get('item_id')}`",
+        f"Target: `{result.get('target')}`",
+        "Goal complete: `false`",
+        f"Reason: {result.get('reason')}",
+        "",
+        "## Execution",
+        "",
+        f"- execute_requested: `{str(result.get('execute_requested')).lower()}`",
+        f"- confirmation_required: `{str(result.get('confirmation_required')).lower()}`",
+        f"- confirmation_ok: `{str(result.get('confirmation_ok')).lower()}`",
+        f"- ui_action_executed: `{str(result.get('receipt', {}).get('ui_action_executed')).lower()}`",
+        f"- model_write_performed: `{str(result.get('receipt', {}).get('model_write_performed')).lower()}`",
+    ]
     return "\n".join(lines) + "\n"
 
 

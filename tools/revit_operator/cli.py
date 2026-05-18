@@ -14,6 +14,7 @@ from .agent_session import (
     build_agent_session_approval_plan,
     build_ui_flow_candidate_approval_plan,
     execute_agent_session_approved_item,
+    execute_ui_flow_approved_candidate,
     plan_agent_session,
     run_agent_session,
     scout_agent_ui_flow,
@@ -976,6 +977,15 @@ def build_parser() -> argparse.ArgumentParser:
     agent_ui_approval.add_argument("--scout", required=True, help="Path to agent_ui_flow_scout.json under the sandbox.")
     agent_ui_approval.add_argument("--limit", type=int, default=10)
 
+    agent_ui_execute = sub.add_parser(
+        "agent-ui-flow-execute-approved-candidate",
+        help="Dry-run or execute one item from private agent-ui-flow approval material.",
+    )
+    agent_ui_execute.add_argument("--approval-material", required=True)
+    agent_ui_execute.add_argument("--item-id", required=True)
+    agent_ui_execute.add_argument("--execute", action="store_true")
+    agent_ui_execute.add_argument("--confirmation", default="")
+
     agent_session_approval = sub.add_parser(
         "agent-session-approval-plan",
         help="Create a fresh approval packet for gated Revit agent session phases without executing them.",
@@ -1149,6 +1159,7 @@ _STDOUT_REDACTED_APPROVAL_COMMANDS = {
     "agent-session-checkpoint",
     "agent-ui-flow-scout",
     "agent-ui-flow-approval-plan",
+    "agent-ui-flow-execute-approved-candidate",
     "agent-model-open-choreography",
     "agent-session-approval-plan",
     "agent-session-execute-approved-item",
@@ -2254,6 +2265,18 @@ def dispatch(args: argparse.Namespace) -> dict:
                 journal,
                 scout_path=Path(args.scout),
                 limit=args.limit,
+            ),
+            "journal": journal.describe(),
+        }
+    elif command == "agent-ui-flow-execute-approved-candidate":
+        return {
+            **execute_ui_flow_approved_candidate(
+                journal,
+                observer,
+                approval_material_path=Path(args.approval_material),
+                item_id=args.item_id,
+                execute=args.execute,
+                confirmation=args.confirmation,
             ),
             "journal": journal.describe(),
         }

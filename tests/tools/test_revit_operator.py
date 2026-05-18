@@ -23378,6 +23378,9 @@ def test_agent_session_execute_approved_model_change_dry_run_redacts_tokens(tmp_
     assert result["success"] is True
     assert result["status"] == "ready_for_approval_execution"
     assert result["execution"]["executed"] is False
+    assert result["execution"]["pre_action_active_document"]["available"] is False
+    assert result["execution"]["post_action_refresh"] is None
+    assert result["execution"]["receipt"]["post_action_refresh_requested"] is False
     assert "APPROVE:" not in json.dumps(result)
     assert "APPROVE:" not in (run_journal.run_dir / "agent_session_approved_item_result.json").read_text(
         encoding="utf-8"
@@ -23439,10 +23442,14 @@ def test_agent_session_execute_approved_model_change_requires_exact_confirmation
         bridge_refresh_timeout=0,
     )
     model_calls = [call for call in calls if call.operation == "reload-links"]
+    refresh_calls = [call for call in calls if call.operation == "active-document"]
     assert executed["status"] == "executed"
     assert executed["execution"]["executed"] is True
     assert model_calls
+    assert refresh_calls
     assert model_calls[-1].approval_token.startswith("APPROVE:")
+    assert executed["execution"]["receipt"]["post_action_refresh_requested"] is True
+    assert executed["execution"]["post_action_refresh"]["command"]["operation"] == "active-document"
     assert "APPROVE:" not in json.dumps(executed)
 
 

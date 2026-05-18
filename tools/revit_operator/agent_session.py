@@ -1394,6 +1394,7 @@ def _execute_model_change_item(
     operation = str(item.get("operation") or "")
     payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
     token = str(item.get("approval_token") or "")
+    pre_action_document = _safe_bridge_active_document(bridge)
     request = OperationRequest(
         operation=operation,
         args=payload,
@@ -1405,15 +1406,48 @@ def _execute_model_change_item(
     result = queue_operation(journal, request)
     command_id = result.get("command", {}).get("id")
     wait_result = None
+    post_action_refresh = None
+    post_action_wait = None
+    post_action_document = None
     if execute and result.get("success") and command_id:
         wait_result = bridge.wait_for_command_result(command_id, timeout=60, poll=1)
+    if execute and result.get("success"):
+        post_action_refresh = queue_operation(
+            journal,
+            OperationRequest(operation="active-document", args={}, dry_run=False),
+        )
+        refresh_id = post_action_refresh.get("command", {}).get("id")
+        if post_action_refresh.get("success") and refresh_id:
+            post_action_wait = bridge.wait_for_command_result(refresh_id, timeout=15, poll=1)
+        post_action_document = _safe_bridge_active_document(bridge)
     return {
         "kind": "model-change-operation",
         "operation": operation,
+        "pre_action_active_document": _without_approval_tokens(pre_action_document),
         "dry_run_result": _without_approval_tokens(result),
         "wait_result": _without_approval_tokens(wait_result) if wait_result else None,
+        "post_action_refresh": _without_approval_tokens(post_action_refresh) if post_action_refresh else None,
+        "post_action_wait_result": _without_approval_tokens(post_action_wait) if post_action_wait else None,
+        "post_action_active_document": _without_approval_tokens(post_action_document) if post_action_document else None,
+        "receipt": {
+            "requested_operation": operation,
+            "queued_operation": result.get("command", {}).get("operation"),
+            "model_write_guard": request.allow_model_write,
+            "sync_guard": request.allow_sync,
+            "approval_bound_to_private_item": bool(token),
+            "post_action_refresh_requested": bool(post_action_refresh),
+            "post_action_refresh_success": bool(post_action_refresh and post_action_refresh.get("success")),
+        },
         "executed": bool(execute and result.get("success")),
     }
+
+
+def _safe_bridge_active_document(bridge: RevitBridgeClient) -> dict:
+    try:
+        status = bridge.active_document_status()
+    except Exception as exc:
+        return {"available": False, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    return status if isinstance(status, dict) else {"available": False, "status": "invalid", "raw_status": status}
 
 
 def _execute_ui_workflow_item(

@@ -2568,6 +2568,10 @@ def _completion_requirement_summaries(checklist: list[dict]) -> list[dict]:
 
 
 def _completion_hard_gates(artifacts: list[dict], *, target_hours: float) -> list[dict]:
+    ui_ready = _ready_ui_artifacts(artifacts)
+    model_change_ready = _ready_model_change_artifacts(artifacts)
+    prompt_ready = _classified_prompt_artifacts(artifacts)
+    active_supervision = _active_supervision_status_artifacts(artifacts)
     gates = [
         {
             "id": "arbitrary-ui-live-execution",
@@ -2575,12 +2579,22 @@ def _completion_hard_gates(artifacts: list[dict], *, target_hours: float) -> lis
             "passed": bool(_artifacts_by_schema(artifacts, "hermes-revit-agent-ui-flow-scout/v1"))
             and bool(_approved_executed_ui_artifacts(artifacts)),
             "reason": "Requires both a UI scout and an executed approved UI action artifact.",
+            "readiness_evidence": _artifact_evidence(
+                ui_ready,
+                "A UI candidate dry-run is ready for explicit approval/execution.",
+            ),
+            "next_required_real_condition": "Execute an approved UI item with the exact confirmation phrase.",
         },
         {
             "id": "approved-model-change-live-execution",
             "requirement_id": "approved-model-changing-work",
             "passed": bool(_executed_model_change_artifacts(artifacts, require_post_document=True)),
             "reason": "Requires an executed approved model-change receipt with post-action document evidence.",
+            "readiness_evidence": _artifact_evidence(
+                model_change_ready,
+                "A model-change dry-run is ready for explicit approval/execution.",
+            ),
+            "next_required_real_condition": "Execute an approved model-change item with exact confirmation and guard flags.",
         },
         {
             "id": "model-open-full-prompt-and-ready",
@@ -2589,12 +2603,22 @@ def _completion_hard_gates(artifacts: list[dict], *, target_hours: float) -> lis
             and bool(_classified_prompt_artifacts(artifacts))
             and bool(_model_ready_artifacts(artifacts)),
             "reason": "Requires prompt events, prompt classification/approval handling, and model-ready verification.",
+            "readiness_evidence": _artifact_evidence(
+                prompt_ready,
+                "Prompt classification/approval material exists, but live prompt execution/readiness is not fully proven.",
+            ),
+            "next_required_real_condition": "Observe a real model-open/startup prompt sequence and verify model readiness after approved handling.",
         },
         {
             "id": "multi-hour-live-supervision-target",
             "requirement_id": "multi-hour-task-planning",
             "passed": bool(_endurance_target_artifacts(artifacts, target_hours=target_hours)),
             "reason": f"Requires a supervision-endurance-audit target_met artifact for at least {target_hours:g} hours.",
+            "readiness_evidence": _artifact_evidence(
+                active_supervision,
+                "A supervision status artifact shows active observation or partial endurance progress.",
+            ),
+            "next_required_real_condition": "Let live supervision continue until the endurance audit target is met.",
         },
     ]
     return gates
@@ -2683,6 +2707,16 @@ def _approved_executed_ui_artifacts(artifacts: list[dict]) -> list[dict]:
     return result
 
 
+def _ready_ui_artifacts(artifacts: list[dict]) -> list[dict]:
+    return [
+        artifact
+        for artifact in artifacts
+        if artifact.get("schema") == "hermes-revit-agent-ui-flow-approved-candidate/v1"
+        and artifact["payload"].get("status") == "ready_for_approval_execution"
+        and not artifact["payload"].get("execute_requested")
+    ]
+
+
 def _ui_before_after_artifacts(artifacts: list[dict]) -> list[dict]:
     result = []
     for artifact in _executed_ui_artifacts(artifacts):
@@ -2705,6 +2739,20 @@ def _model_change_planning_artifacts(artifacts: list[dict]) -> list[dict]:
         ):
             result.append(artifact)
         if schema == "hermes-revit-agent-session-plan/v1" and payload.get("model_change_requests"):
+            result.append(artifact)
+    return result
+
+
+def _ready_model_change_artifacts(artifacts: list[dict]) -> list[dict]:
+    result = []
+    for artifact in artifacts:
+        payload = artifact["payload"]
+        if artifact.get("schema") != "hermes-revit-agent-session-approved-item/v1":
+            continue
+        if payload.get("item_kind") != "model-change-operation":
+            continue
+        execution = payload.get("execution") if isinstance(payload.get("execution"), dict) else {}
+        if payload.get("status") == "ready_for_approval_execution" and not payload.get("execute_requested"):
             result.append(artifact)
     return result
 
@@ -2834,6 +2882,15 @@ def _endurance_target_artifacts(artifacts: list[dict], *, target_hours: float) -
         if payload.get("target_met") and float(payload.get("target_hours") or 0.0) >= target_hours:
             result.append(artifact)
     return result
+
+
+def _active_supervision_status_artifacts(artifacts: list[dict]) -> list[dict]:
+    return [
+        artifact
+        for artifact in _artifacts_by_schema(artifacts, "hermes-revit-agent-session-supervision-status/v1")
+        if artifact["payload"].get("status") in {"active", "target_met"}
+        or int(artifact["payload"].get("active_supervision_count") or 0) > 0
+    ]
 
 
 def _nested_true_key(value, names: set[str]) -> bool:

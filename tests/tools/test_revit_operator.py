@@ -23356,6 +23356,75 @@ def test_agent_session_completion_audit_maps_artifacts_and_withholds_private_tok
     assert "APPROVE:secret-token" not in artifact_text
 
 
+def test_agent_session_completion_audit_reports_readiness_evidence_without_completion(tmp_path):
+    run_dir = tmp_path / "revit_operator_runs" / "readiness-evidence"
+    run_dir.mkdir(parents=True)
+    (run_dir / "agent_ui_flow_approved_candidate_result.json").write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-agent-ui-flow-approved-candidate/v1",
+                "success": True,
+                "status": "ready_for_approval_execution",
+                "execute_requested": False,
+                "target": "Worksets",
+                "receipt": {
+                    "ui_action_executed": False,
+                    "model_write_performed": False,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "agent_session_approved_item_result.json").write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-agent-session-approved-item/v1",
+                "success": True,
+                "status": "ready_for_approval_execution",
+                "item_kind": "model-change-operation",
+                "execute_requested": False,
+                "execution": {
+                    "operation": "reload-links",
+                    "executed": False,
+                    "receipt": {
+                        "queued_operation": "reload-links",
+                        "model_write_guard": True,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "agent_session_supervision_status.json").write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-agent-session-supervision-status/v1",
+                "success": True,
+                "status": "active",
+                "active_supervision_count": 1,
+                "goal_complete": False,
+                "may_call_update_goal": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = agent_session.build_agent_session_completion_audit(
+        TaskJournal(tmp_path, "agent-session-completion-audit-readiness-test"),
+        objective="have revit autonomously handle arbitrary ui flows and approved model-changing work",
+    )
+
+    gates = {gate["id"]: gate for gate in result["hard_completion_gates"]}
+    assert gates["arbitrary-ui-live-execution"]["passed"] is False
+    assert gates["arbitrary-ui-live-execution"]["readiness_evidence"]
+    assert gates["approved-model-change-live-execution"]["passed"] is False
+    assert gates["approved-model-change-live-execution"]["readiness_evidence"]
+    assert gates["multi-hour-live-supervision-target"]["passed"] is False
+    assert gates["multi-hour-live-supervision-target"]["readiness_evidence"]
+    assert result["goal_complete"] is False
+    assert result["may_call_update_goal"] is False
+
+
 def test_cli_exposes_agent_session_completion_audit_with_redacted_stdout(tmp_path, capsys):
     run_dir = tmp_path / "revit_operator_runs" / "cli-evidence"
     run_dir.mkdir(parents=True)

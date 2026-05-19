@@ -1178,6 +1178,7 @@ def execute_agent_session_approved_item(
     execute: bool = False,
     confirmation: str = "",
     bridge_refresh_timeout: float = 10.0,
+    allow_approved_ui: bool = False,
     ui_command_runner=None,
 ) -> dict:
     """Dry-run or execute one explicitly approved session item."""
@@ -1204,20 +1205,38 @@ def execute_agent_session_approved_item(
     )
     expected_phrase = f"I approve {item_id}"
     confirmation_ok = str(confirmation or "").strip() == expected_phrase
+    item_kind = str(item.get("kind") or "")
+    ui_operator_consent_ok = bool(
+        execute
+        and allow_approved_ui
+        and item_kind == "ui-workflow-step"
+        and item.get("approval_token")
+    )
+    execution_allowed = (not execute) or confirmation_ok or ui_operator_consent_ok
+    approval_relaxation_policy = (
+        "approved-ui-only-private-material-operator-consent"
+        if ui_operator_consent_ok
+        else None
+    )
     execution = {
         "executed": False,
         "dry_run": not execute,
-        "confirmation_required": execute,
+        "confirmation_required": bool(execute and not ui_operator_consent_ok),
         "confirmation_ok": confirmation_ok,
         "expected_confirmation_phrase": expected_phrase,
+        "allow_approved_ui": bool(allow_approved_ui),
+        "ui_operator_consent_ok": ui_operator_consent_ok,
+        "confirmation_bypassed_for_ui_only": bool(ui_operator_consent_ok and not confirmation_ok),
+        "approval_relaxation_policy": approval_relaxation_policy,
+        "model_write_performed": False,
     }
     if preflight.get("status") == "stopped_on_modal":
         status = "stopped_on_modal"
         reason = "Fresh preflight found a modal dialog before approved execution."
-    elif execute and not confirmation_ok:
+    elif not execution_allowed:
         status = "stopped_confirmation_required"
-        reason = "Execution requires the exact human confirmation phrase for this item."
-    elif item.get("kind") == "model-change-operation":
+        reason = "Execution requires the exact human confirmation phrase, except for UI-only items with --allow-approved-ui."
+    elif item_kind == "model-change-operation":
         execution.update(
             _execute_model_change_item(
                 journal,
@@ -1232,7 +1251,8 @@ def execute_agent_session_approved_item(
             if execution.get("executed")
             else "Approved model-change item dry-run completed; no Revit change was queued."
         )
-    elif item.get("kind") == "ui-workflow-step":
+        execution["model_write_performed"] = bool(execution.get("executed"))
+    elif item_kind == "ui-workflow-step":
         execution.update(
             _execute_ui_workflow_item(
                 journal,
@@ -1244,7 +1264,11 @@ def execute_agent_session_approved_item(
         )
         status = "executed" if execution.get("executed") else "ready_for_approval_execution"
         reason = (
-            "Approved UI workflow item executed."
+            (
+                "Approved UI workflow item executed under UI-only operator consent."
+                if ui_operator_consent_ok and not confirmation_ok
+                else "Approved UI workflow item executed."
+            )
             if execution.get("executed")
             else "Approved UI workflow item dry-run completed; no UI action was executed."
         )
@@ -1280,11 +1304,23 @@ def execute_agent_session_approved_item(
     journal.write_entry(
         {
             "command": "agent-session-execute-approved-item",
-            "requested_action": {"item_id": item_id, "execute": bool(execute)},
+            "requested_action": {
+                "item_id": item_id,
+                "execute": bool(execute),
+                "allow_approved_ui": bool(allow_approved_ui),
+            },
             "risk_classification": classify_action("agent-session-execute-approved-item", {}).to_dict(),
             "approval_status": {
-                "allowed": not execute or confirmation_ok,
-                "reason": "Exact confirmation supplied." if confirmation_ok else "Dry-run or missing confirmation.",
+                "allowed": execution_allowed,
+                "reason": (
+                    "Exact confirmation supplied."
+                    if confirmation_ok
+                    else (
+                        "UI-only operator consent supplied."
+                        if ui_operator_consent_ok
+                        else "Dry-run or missing confirmation."
+                    )
+                ),
             },
             "result": {
                 "status": status,
@@ -1578,6 +1614,7 @@ def execute_ui_flow_approved_candidate(
     item_id: str,
     execute: bool = False,
     confirmation: str = "",
+    allow_approved_ui: bool = False,
 ) -> dict:
     """Dry-run or execute one candidate from private UI scout approval material."""
 
@@ -1613,6 +1650,13 @@ def execute_ui_flow_approved_candidate(
 
     expected_confirmation = f"I approve {item_id}"
     confirmation_ok = str(confirmation or "").strip() == expected_confirmation
+    ui_operator_consent_ok = bool(execute and allow_approved_ui and item.get("approval_token"))
+    execution_allowed = (not execute) or confirmation_ok or ui_operator_consent_ok
+    approval_relaxation_policy = (
+        "approved-ui-only-private-material-operator-consent"
+        if ui_operator_consent_ok
+        else None
+    )
     pre_action_status = _observer_result(observer, "status")
     pre_action_dialogs = _observer_result(observer, "list_dialogs")
     active_dialogs = _visible_dialogs(pre_action_status, pre_action_dialogs)
@@ -1622,9 +1666,9 @@ def execute_ui_flow_approved_candidate(
     if has_modal:
         status = "stopped_on_modal"
         reason = "Fresh observation found a modal dialog before approved UI candidate execution."
-    elif execute and not confirmation_ok:
+    elif not execution_allowed:
         status = "stopped_confirmation_required"
-        reason = "Execution requires the exact human confirmation phrase for this UI candidate."
+        reason = "Execution requires the exact human confirmation phrase or --allow-approved-ui for approved UI-only candidates."
     else:
         action_result = SafeActionExecutor(observer, journal).run(
             ActionRequest(
@@ -1637,7 +1681,11 @@ def execute_ui_flow_approved_candidate(
         if execute:
             status = "executed" if action_result.get("executed") else "failed"
             reason = (
-                "Approved UI candidate executed."
+                (
+                    "Approved UI candidate executed under UI-only operator consent."
+                    if ui_operator_consent_ok and not confirmation_ok
+                    else "Approved UI candidate executed."
+                )
                 if action_result.get("executed")
                 else "Approved UI candidate execution failed or was blocked by verification."
             )
@@ -1657,9 +1705,13 @@ def execute_ui_flow_approved_candidate(
         "item_kind": item.get("kind"),
         "target": item.get("target"),
         "execute_requested": bool(execute),
-        "confirmation_required": bool(execute),
+        "confirmation_required": bool(execute and not ui_operator_consent_ok),
         "confirmation_ok": confirmation_ok,
         "expected_confirmation_phrase": expected_confirmation,
+        "allow_approved_ui": bool(allow_approved_ui),
+        "ui_operator_consent_ok": ui_operator_consent_ok,
+        "confirmation_bypassed_for_ui_only": bool(ui_operator_consent_ok and not confirmation_ok),
+        "approval_relaxation_policy": approval_relaxation_policy,
         "pre_action_observation": {
             "status": pre_action_status,
             "dialogs": pre_action_dialogs,
@@ -1669,6 +1721,9 @@ def execute_ui_flow_approved_candidate(
         "action_result": _without_approval_tokens(action_result) if action_result else None,
         "receipt": {
             "approval_bound_to_private_item": bool(item.get("approval_token")),
+            "approved_ui_operator_consent": ui_operator_consent_ok,
+            "confirmation_bypassed_for_ui_only": bool(ui_operator_consent_ok and not confirmation_ok),
+            "approval_relaxation_policy": approval_relaxation_policy,
             "private_material_schema": material.get("schema") if isinstance(material, dict) else None,
             "source_scout_path": material.get("source_scout_path") if isinstance(material, dict) else None,
             "ui_action_executed": bool(action_result and action_result.get("executed")),
@@ -1690,11 +1745,23 @@ def execute_ui_flow_approved_candidate(
     journal.write_entry(
         {
             "command": "agent-ui-flow-execute-approved-candidate",
-            "requested_action": {"item_id": item_id, "execute": bool(execute)},
+            "requested_action": {
+                "item_id": item_id,
+                "execute": bool(execute),
+                "allow_approved_ui": bool(allow_approved_ui),
+            },
             "risk_classification": _without_approval_tokens(classify_action("uia-invoke", payload).to_dict()),
             "approval_status": {
-                "allowed": not execute or confirmation_ok,
-                "reason": "Exact confirmation supplied." if confirmation_ok else "Dry-run or missing confirmation.",
+                "allowed": execution_allowed,
+                "reason": (
+                    "Exact confirmation supplied."
+                    if confirmation_ok
+                    else (
+                        "UI-only operator consent supplied."
+                        if ui_operator_consent_ok
+                        else "Dry-run or missing confirmation."
+                    )
+                ),
             },
             "result": {
                 "status": status,
@@ -3243,6 +3310,18 @@ def _approval_readiness_item(
                 item_id,
             ]
         )
+        base["approved_ui_operator_consent_supported"] = True
+        base["approved_ui_execute_command"] = _command(
+            [
+                "agent-ui-flow-execute-approved-candidate",
+                "--approval-material",
+                str(material_path),
+                "--item-id",
+                item_id,
+                "--execute",
+                "--allow-approved-ui",
+            ]
+        )
     elif material_kind == "agent-session-item":
         base["dry_run_command"] = _command(
             [
@@ -3255,6 +3334,25 @@ def _approval_readiness_item(
                 "0",
             ]
         )
+        ui_only = str(item.get("kind") or "") == "ui-workflow-step"
+        base["approved_ui_operator_consent_supported"] = ui_only
+        base["approved_ui_execute_command"] = (
+            _command(
+                [
+                    "agent-session-execute-approved-item",
+                    "--approval-material",
+                    str(material_path),
+                    "--item-id",
+                    item_id,
+                    "--execute",
+                    "--allow-approved-ui",
+                    "--bridge-refresh-timeout",
+                    "0",
+                ]
+            )
+            if ui_only
+            else None
+        )
     elif material_kind == "model-open-prompt":
         base["dry_run_command"] = _command(
             [
@@ -3265,8 +3363,16 @@ def _approval_readiness_item(
                 item_id,
             ]
         )
+        base["approved_ui_operator_consent_supported"] = False
+        base["approved_ui_execute_command"] = None
     else:
         return None
+    base["approved_ui_operator_consent_policy"] = (
+        "UI-only approved private material may execute with --allow-approved-ui; "
+        "model-changing items and model-open prompts still require exact confirmation."
+        if base.get("approved_ui_operator_consent_supported")
+        else "Not a UI-only approved action; exact confirmation remains required for execution."
+    )
     check = _completion_command_check(str(base["dry_run_command"]))
     base["dry_run_read_only"] = check["read_only"]
     base["dry_run_contains_execute_flag"] = check["contains_execute_flag"]
@@ -3313,6 +3419,11 @@ def _approval_recommendation_reason(item: dict) -> str:
         return "Stale item retained for traceability; refresh approval material before using it."
     if item.get("source_context") == "synthetic_or_smoke":
         return "Synthetic/smoke item retained for testing evidence; prefer live approval material for real Revit work."
+    if item.get("approved_ui_operator_consent_supported"):
+        return (
+            "Fresh live UI-only approval material; still requires dry-run, fresh observation, "
+            "and either --allow-approved-ui or exact human confirmation before execution."
+        )
     return "Fresh live approval material; still requires dry-run, exact human confirmation, and fresh observation before execution."
 
 
@@ -4216,8 +4327,19 @@ def _approved_item_markdown(result: dict) -> str:
         "",
     ]
     execution = result.get("execution") if isinstance(result.get("execution"), dict) else {}
-    for key in ("executed", "dry_run", "confirmation_required", "confirmation_ok"):
+    for key in (
+        "executed",
+        "dry_run",
+        "confirmation_required",
+        "confirmation_ok",
+        "allow_approved_ui",
+        "ui_operator_consent_ok",
+        "confirmation_bypassed_for_ui_only",
+        "model_write_performed",
+    ):
         lines.append(f"- {key}: `{str(execution.get(key)).lower()}`")
+    if execution.get("approval_relaxation_policy"):
+        lines.append(f"- approval_relaxation_policy: `{execution.get('approval_relaxation_policy')}`")
     return "\n".join(lines) + "\n"
 
 
@@ -4293,9 +4415,14 @@ def _ui_flow_approved_candidate_markdown(result: dict) -> str:
         f"- execute_requested: `{str(result.get('execute_requested')).lower()}`",
         f"- confirmation_required: `{str(result.get('confirmation_required')).lower()}`",
         f"- confirmation_ok: `{str(result.get('confirmation_ok')).lower()}`",
+        f"- allow_approved_ui: `{str(result.get('allow_approved_ui')).lower()}`",
+        f"- ui_operator_consent_ok: `{str(result.get('ui_operator_consent_ok')).lower()}`",
+        f"- confirmation_bypassed_for_ui_only: `{str(result.get('confirmation_bypassed_for_ui_only')).lower()}`",
         f"- ui_action_executed: `{str(result.get('receipt', {}).get('ui_action_executed')).lower()}`",
         f"- model_write_performed: `{str(result.get('receipt', {}).get('model_write_performed')).lower()}`",
     ]
+    if result.get("approval_relaxation_policy"):
+        lines.append(f"- approval_relaxation_policy: `{result.get('approval_relaxation_policy')}`")
     return "\n".join(lines) + "\n"
 
 

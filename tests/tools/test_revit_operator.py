@@ -23642,6 +23642,15 @@ def test_agent_session_approval_readiness_queue_lists_items_without_tokens(tmp_p
     assert any(command.startswith("agent-model-open-execute-approved-prompt") for command in commands)
     assert all("--execute" not in command for command in commands)
     assert all("APPROVE:" not in command for command in commands)
+    ui_item = next(item for item in result["ready_items"] if item["id"] == "ui-candidate:7:worksets")
+    model_item = next(item for item in result["ready_items"] if item["id"] == "model-change:reload-links")
+    prompt_item = next(item for item in result["ready_items"] if item["id"] == "prompt:0:0:ok")
+    assert ui_item["approved_ui_operator_consent_supported"] is True
+    assert "--allow-approved-ui" in ui_item["approved_ui_execute_command"]
+    assert "--execute" in ui_item["approved_ui_execute_command"]
+    assert model_item["approved_ui_operator_consent_supported"] is False
+    assert model_item["approved_ui_execute_command"] is None
+    assert prompt_item["approved_ui_operator_consent_supported"] is False
     assert all(item["fresh"] is True for item in result["recommended_items"])
     assert all(item["source_context"] == "live_or_user_generated" for item in result["recommended_items"])
     assert "APPROVE:" not in json.dumps(result)
@@ -24080,6 +24089,23 @@ def test_agent_session_execute_approved_model_change_requires_exact_confirmation
     assert all(call.operation == "active-document" for call in calls)
 
     calls.clear()
+    ui_consent_wrong = agent_session.execute_agent_session_approved_item(
+        TaskJournal(tmp_path, "approved-item-ui-consent-does-not-bypass-model-change"),
+        FakeObserver(),
+        RevitBridgeClient(tmp_path),
+        approval_material_path=Path(approval["private_material_path"]),
+        item_id="model-change:reload-links",
+        execute=True,
+        allow_approved_ui=True,
+        bridge_refresh_timeout=0,
+    )
+    assert ui_consent_wrong["status"] == "stopped_confirmation_required"
+    assert ui_consent_wrong["execution"]["allow_approved_ui"] is True
+    assert ui_consent_wrong["execution"]["ui_operator_consent_ok"] is False
+    assert ui_consent_wrong["execution"]["confirmation_bypassed_for_ui_only"] is False
+    assert all(call.operation == "active-document" for call in calls)
+
+    calls.clear()
     executed = agent_session.execute_agent_session_approved_item(
         TaskJournal(tmp_path, "approved-item-execute-confirm"),
         FakeObserver(),
@@ -24100,6 +24126,55 @@ def test_agent_session_execute_approved_model_change_requires_exact_confirmation
     assert executed["execution"]["receipt"]["post_action_refresh_requested"] is True
     assert executed["execution"]["post_action_refresh"]["command"]["operation"] == "active-document"
     assert "APPROVE:" not in json.dumps(executed)
+
+
+def test_agent_session_execute_approved_ui_workflow_allows_operator_consent(tmp_path):
+    class FakeObserver:
+        def status(self):
+            return {
+                "state": "idle",
+                "active_dialogs": [],
+                "main_window": {"hwnd": 1, "title": "Autodesk Revit 2025"},
+                "revit_running": True,
+            }
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+    approval = agent_session.build_agent_session_approval_plan(
+        TaskJournal(tmp_path, "approval-source-ui-consent"),
+        objective="Open Manage Links for inspection if approved.",
+    )
+    calls = []
+
+    def fake_runner(argv, index):
+        calls.append((index, argv))
+        return {"success": True, "argv": argv}
+
+    result = agent_session.execute_agent_session_approved_item(
+        TaskJournal(tmp_path, "approved-ui-workflow-consent"),
+        FakeObserver(),
+        RevitBridgeClient(tmp_path),
+        approval_material_path=Path(approval["private_material_path"]),
+        item_id="ui:manage-links-inspection:step:2",
+        execute=True,
+        allow_approved_ui=True,
+        bridge_refresh_timeout=0,
+        ui_command_runner=fake_runner,
+    )
+
+    assert result["status"] == "executed"
+    assert result["execution"]["executed"] is True
+    assert result["execution"]["confirmation_required"] is False
+    assert result["execution"]["confirmation_ok"] is False
+    assert result["execution"]["ui_operator_consent_ok"] is True
+    assert result["execution"]["confirmation_bypassed_for_ui_only"] is True
+    assert result["execution"]["approval_relaxation_policy"] == "approved-ui-only-private-material-operator-consent"
+    assert result["execution"]["model_write_performed"] is False
+    assert calls[-1][1][:2] == ["ribbon-action", "--name"]
+    assert "--execute" in calls[-1][1]
+    assert "--approval-token" in calls[-1][1]
+    assert "APPROVE:" not in json.dumps(result)
 
 
 def test_cli_exposes_agent_session_execute_approved_item_dry_run(tmp_path, capsys, monkeypatch):
@@ -24586,6 +24661,29 @@ def test_agent_ui_flow_execute_approved_candidate_requires_exact_confirmation(tm
     assert wrong["status"] == "stopped_confirmation_required"
     assert calls == []
 
+    allowed_by_ui_consent = agent_session.execute_ui_flow_approved_candidate(
+        TaskJournal(tmp_path, "agent-ui-flow-execute-allow-approved-ui"),
+        FakeObserver(),
+        approval_material_path=material_path,
+        item_id="ui-candidate:0:manage-links",
+        execute=True,
+        allow_approved_ui=True,
+    )
+
+    assert allowed_by_ui_consent["status"] == "executed"
+    assert allowed_by_ui_consent["confirmation_required"] is False
+    assert allowed_by_ui_consent["confirmation_ok"] is False
+    assert allowed_by_ui_consent["allow_approved_ui"] is True
+    assert allowed_by_ui_consent["ui_operator_consent_ok"] is True
+    assert allowed_by_ui_consent["confirmation_bypassed_for_ui_only"] is True
+    assert allowed_by_ui_consent["approval_relaxation_policy"] == "approved-ui-only-private-material-operator-consent"
+    assert allowed_by_ui_consent["receipt"]["approved_ui_operator_consent"] is True
+    assert allowed_by_ui_consent["receipt"]["model_write_performed"] is False
+    assert calls[-1].action == "uia-invoke"
+    assert calls[-1].dry_run is False
+    assert calls[-1].approval_token.startswith("APPROVE:")
+    assert "APPROVE:" not in json.dumps(allowed_by_ui_consent)
+
     executed = agent_session.execute_ui_flow_approved_candidate(
         TaskJournal(tmp_path, "agent-ui-flow-execute-right-confirm"),
         FakeObserver(),
@@ -24665,6 +24763,91 @@ def test_cli_exposes_agent_ui_flow_execute_approved_candidate_dry_run(tmp_path, 
     output = json.loads(stdout)
     assert output["status"] == "ready_for_approval_execution"
     assert output["action_result"]["status"] == "dry_run"
+    assert "APPROVE:" not in stdout
+
+
+def test_cli_exposes_agent_ui_flow_execute_approved_candidate_allow_approved_ui(tmp_path, capsys, monkeypatch):
+    class FakeObserver:
+        def status(self):
+            return {
+                "state": "idle",
+                "active_dialogs": [],
+                "main_window": {"hwnd": 101, "title": "Autodesk Revit 2025"},
+                "revit_running": True,
+            }
+
+        def list_dialogs(self):
+            return {"supported": True, "dialogs": []}
+
+    class FakeExecutor:
+        def __init__(self, observer, journal):
+            self.observer = observer
+            self.journal = journal
+
+        def run(self, request):
+            return {
+                "status": "executed",
+                "executed": True,
+                "dry_run": request.dry_run,
+                "policy": {"approval_token": request.approval_token},
+                "authorization": {"allowed": True},
+            }
+
+    monkeypatch.setattr(cli, "RevitWindowObserver", lambda: FakeObserver())
+    monkeypatch.setattr(agent_session, "SafeActionExecutor", FakeExecutor)
+    source = TaskJournal(tmp_path, "agent-ui-flow-execute-cli-consent-source")
+    scout_path = source.run_dir / "agent_ui_flow_scout.json"
+    scout_path.write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-agent-ui-flow-scout/v1",
+                "status": "candidates_found",
+                "candidates": [
+                    {
+                        "target": "Manage Links",
+                        "source": "uia",
+                        "control_type": "Button",
+                        "automation_id": "ID_MANAGE_LINKS",
+                        "class_name": "Button",
+                        "matched_terms": ["manage"],
+                        "confidence": "medium",
+                        "path": "Autodesk Revit > Manage Links",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    approval = agent_session.build_ui_flow_candidate_approval_plan(
+        TaskJournal(tmp_path, "agent-ui-flow-execute-cli-consent-approval"),
+        scout_path=scout_path,
+    )
+
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "agent-ui-flow-execute-cli-consent-test",
+            "agent-ui-flow-execute-approved-candidate",
+            "--approval-material",
+            approval["private_material_path"],
+            "--item-id",
+            "ui-candidate:0:manage-links",
+            "--execute",
+            "--allow-approved-ui",
+        ]
+    )
+
+    assert code == 0
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
+    assert output["status"] == "executed"
+    assert output["allow_approved_ui"] is True
+    assert output["ui_operator_consent_ok"] is True
+    assert output["confirmation_bypassed_for_ui_only"] is True
+    assert output["receipt"]["model_write_performed"] is False
     assert "APPROVE:" not in stdout
 
 

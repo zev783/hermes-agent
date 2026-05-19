@@ -40,6 +40,14 @@ R25 means Revit 2025.
 
 Do not write to LucidLink, Autodesk Docs, cloud, central, or production files by default. Save/sync/modify operations are available only as explicit named add-in operations with exact approval and guard flags.
 
+Approved UI-only items from private approval material may be executed with
+`--execute --allow-approved-ui` after a fresh dry-run/readiness check. This
+relaxes the outer `I approve <item-id>` phrase only for UI workflow steps and
+UIA candidate controls that already carry a fresh private approval token. It
+does not apply to model-changing items, model-open prompts, Save, Sync,
+Publish, reload links, detach/upgrade/workset prompts, destructive dialog
+buttons, or unknown dialogs.
+
 To rehearse the current approval gates without executing any UI or model action:
 
 ```powershell
@@ -48,6 +56,18 @@ revit-operator action-approval-matrix
 
 Expected: `success: true`, `dry_run_only: true`, blocked Save cases, approval
 tokens for high-risk representative actions, and `executed_count: 0`.
+
+To list fresh approval material without exposing tokens, including UI-only
+operator-consent commands when available:
+
+```powershell
+revit-operator agent-session-approval-readiness-queue
+```
+
+Expected: `approval_tokens_included: false`. UI-only rows may include
+`approved_ui_execute_command` with `--allow-approved-ui`; model-change and
+model-open prompt rows keep `approved_ui_execute_command: null` and still
+require exact confirmation.
 
 Audit which authorized live UI surfaces have actually executed:
 

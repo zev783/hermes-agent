@@ -1091,6 +1091,14 @@ def build_parser() -> argparse.ArgumentParser:
     agent_ui_execute.add_argument("--item-id", required=True)
     agent_ui_execute.add_argument("--execute", action="store_true")
     agent_ui_execute.add_argument("--confirmation", default="")
+    agent_ui_execute.add_argument(
+        "--allow-approved-ui",
+        action="store_true",
+        help=(
+            "Allow execution of this approved UI-only private-material item without the exact "
+            "I approve <item-id> phrase. Does not apply to model changes or prompts."
+        ),
+    )
 
     agent_session_approval = sub.add_parser(
         "agent-session-approval-plan",
@@ -1118,6 +1126,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirmation",
         default="",
         help="Exact human phrase required when --execute is supplied: I approve <item-id>",
+    )
+    agent_session_execute.add_argument(
+        "--allow-approved-ui",
+        action="store_true",
+        help=(
+            "Allow execution of approved UI workflow items without the exact confirmation phrase. "
+            "Model-changing items still require exact confirmation."
+        ),
     )
     agent_session_execute.add_argument("--bridge-refresh-timeout", type=float, default=10.0)
 
@@ -2480,6 +2496,7 @@ def dispatch(args: argparse.Namespace) -> dict:
                 item_id=args.item_id,
                 execute=args.execute,
                 confirmation=args.confirmation,
+                allow_approved_ui=args.allow_approved_ui,
             ),
             "journal": journal.describe(),
         }
@@ -2507,6 +2524,7 @@ def dispatch(args: argparse.Namespace) -> dict:
                 execute=args.execute,
                 confirmation=args.confirmation,
                 bridge_refresh_timeout=args.bridge_refresh_timeout,
+                allow_approved_ui=args.allow_approved_ui,
                 ui_command_runner=_ui_workflow_command_runner(
                     sandbox,
                     parent_task_id=journal.task_id,

@@ -69,6 +69,18 @@ Expected: `approval_tokens_included: false`. UI-only rows may include
 model-open prompt rows keep `approved_ui_execute_command: null` and still
 require exact confirmation.
 
+To inventory the untracked copied-project RVT examples that Hermes may use for
+dry-run/open choreography:
+
+```powershell
+revit-operator list-safe-models
+```
+
+Expected: `read_only: true`. The command scans the known copied local project,
+skips the sandbox by default, marks the current structural R25/Revit 2025 test
+model, and emits `agent-model-open-choreography` dry-run argv only. It does not
+open Revit, touch model files, save, sync, or export metadata.
+
 Audit which authorized live UI surfaces have actually executed:
 
 ```powershell

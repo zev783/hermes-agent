@@ -20,6 +20,7 @@ Observation and read-only commands:
 
 - `serve`
 - `health`
+- `list-safe-models`
 - `north-star-status`
 - `north-star-audit`
 - `north-star-approval-plan`

@@ -1891,6 +1891,7 @@ def test_process_and_wait_observation_actions_are_allowed():
     assert classify_action("north-star-unblock-readiness").decision == "allow"
     assert classify_action("transport-safety-matrix").decision == "allow"
     assert classify_action("list-revit-installs").decision == "allow"
+    assert classify_action("list-safe-models").decision == "allow"
     assert classify_action("wait-for-window").decision == "allow"
     assert classify_action("wait-for-dialog").decision == "allow"
     assert classify_action("wait-model-ready").decision == "allow"
@@ -1926,6 +1927,80 @@ def test_process_and_wait_observation_actions_are_allowed():
         "run-safe-command", {"name": "active-document"}
     ).decision == "allow"
     assert classify_action("run-safe-command", {"name": "save"}).decision == BLOCK
+
+
+def test_list_safe_project_models_marks_current_model_and_skips_sandbox(tmp_path):
+    project = tmp_path / "copied-project"
+    sandbox = project / "_AI_Hermes_Sandbox_DO_NOT_USE_FOR_PERMIT"
+    current = project / "Drawings" / "Working Drawings" / "Structural_Current Working-R25-BIM.rvt"
+    other = project / "Drawings" / "Archive" / "Old-R22.rvt"
+    sandbox_model = sandbox / "scratch-R25.rvt"
+    current.parent.mkdir(parents=True)
+    other.parent.mkdir(parents=True)
+    sandbox_model.parent.mkdir(parents=True)
+    current.write_bytes(b"current model placeholder")
+    other.write_bytes(b"old model placeholder")
+    sandbox_model.write_bytes(b"sandbox placeholder")
+
+    result = revit_locator.list_safe_project_models(
+        project,
+        current_model=current,
+    )
+
+    assert result["success"] is True
+    assert result["read_only"] is True
+    assert result["project_root"] == str(project)
+    assert result["current_test_model"]["listed"] is True
+    assert result["model_count"] == 2
+    paths = {item["path"] for item in result["models"]}
+    assert str(current) in paths
+    assert str(other) in paths
+    assert str(sandbox_model) not in paths
+    current_item = next(item for item in result["models"] if item["is_current_test_model"])
+    assert current_item["inferred_revit_version"] == "2025"
+    assert current_item["example_role"] == "current_structural_r25_test_model"
+    assert current_item["safe_dry_run_argv"] == [
+        "agent-model-open-choreography",
+        "--model",
+        str(current),
+        "--revit-version",
+        "2025",
+    ]
+    assert "--execute" not in current_item["safe_dry_run_command"]
+    assert "approval-token" not in current_item["safe_dry_run_command"]
+
+
+def test_cli_exposes_list_safe_models(tmp_path, capsys, monkeypatch):
+    project = tmp_path / "copied-project"
+    current = project / "Drawings" / "Working Drawings" / "sample-R25.rvt"
+    current.parent.mkdir(parents=True)
+    current.write_bytes(b"sample")
+
+    def fake_list_safe_project_models(**kwargs):
+        return revit_locator.list_safe_project_models(
+            project,
+            current_model=current,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(cli, "list_safe_project_models", fake_list_safe_project_models)
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "safe-model-list-cli-test",
+            "list-safe-models",
+        ]
+    )
+
+    assert code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["success"] is True
+    assert output["model_count"] == 1
+    assert output["models"][0]["path"] == str(current)
+    assert output["models"][0]["inferred_revit_version"] == "2025"
 
 
 def test_north_star_audit_reports_not_complete_and_writes_artifact(tmp_path):
@@ -23565,11 +23640,12 @@ def test_cli_exposes_agent_session_real_gate_ledger_with_redacted_stdout(tmp_pat
 def test_agent_session_approval_readiness_queue_lists_items_without_tokens(tmp_path):
     run_dir = tmp_path / "revit_operator_runs" / "approval-materials"
     run_dir.mkdir(parents=True)
+    fresh_now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     (run_dir / "agent_ui_flow_approval_private_material.json").write_text(
         json.dumps(
             {
                 "schema": "hermes-revit-agent-ui-flow-approval-material/v1",
-                "created_at": "2026-05-19T00:00:00Z",
+                "created_at": fresh_now,
                 "source_scout_path": str(run_dir / "agent_ui_flow_scout.json"),
                 "approval_items": [
                     {
@@ -23588,7 +23664,7 @@ def test_agent_session_approval_readiness_queue_lists_items_without_tokens(tmp_p
         json.dumps(
             {
                 "schema": "hermes-revit-agent-session-approval-material/v1",
-                "created_at": "2026-05-19T00:00:01Z",
+                "created_at": fresh_now,
                 "objective": "reload links",
                 "approval_items": [
                     {
@@ -23606,7 +23682,7 @@ def test_agent_session_approval_readiness_queue_lists_items_without_tokens(tmp_p
         json.dumps(
             {
                 "schema": "hermes-revit-model-open-prompt-approval-material/v1",
-                "created_at": "2026-05-19T00:00:02Z",
+                "created_at": fresh_now,
                 "source_choreography_path": str(run_dir / "model_open_choreography.json"),
                 "approval_items": [
                     {

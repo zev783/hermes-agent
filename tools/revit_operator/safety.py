@@ -56,6 +56,7 @@ OBSERVATION_ACTIONS = {
     "status",
     "list-processes",
     "list-revit-installs",
+    "list-safe-models",
     "list-windows",
     "list-dialogs",
     "known-dialogs",

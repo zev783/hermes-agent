@@ -102,7 +102,7 @@ from .project_browser import (
 from .qa import generate_qa_report
 from .readiness import wait_model_ready
 from .recovery import capture_recovery_snapshot, validate_recovery_drill_matrix
-from .revit_locator import default_test_model_info, installed_revit_versions
+from .revit_locator import default_test_model_info, installed_revit_versions, list_safe_project_models
 from .ribbon import list_ribbon_actions, plan_ribbon_action, run_ribbon_action, validate_ribbon_action_matrix
 from .safety import classify_action, classify_dialog, validate_output_path, validate_sandbox_root
 from .session_checkpoint import build_agent_session_resume_plan, write_agent_session_checkpoint
@@ -153,6 +153,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("health", help="Report operator dependencies and platform support.")
     sub.add_parser("version-support", help="Report supported Revit versions and add-in target frameworks.")
+    safe_models = sub.add_parser(
+        "list-safe-models",
+        help="List RVT models under the known copied-project area without opening them.",
+    )
+    safe_models.add_argument("--include-sandbox", action="store_true")
+    safe_models.add_argument("--limit", type=int, default=100)
     north_star_status = sub.add_parser(
         "north-star-status",
         help="Write a compact read-only north-star blocker/status handoff.",
@@ -1649,6 +1655,11 @@ def dispatch(args: argparse.Namespace) -> dict:
             "installs": installed_revit_versions(),
             "default_test_model": default_test_model_info(),
         }
+    elif command == "list-safe-models":
+        result = list_safe_project_models(
+            include_sandbox=args.include_sandbox,
+            limit=args.limit,
+        )
     elif command == "list-windows":
         result = observer.list_windows(include_all=args.all)
     elif command == "list-dialogs":

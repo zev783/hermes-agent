@@ -12,6 +12,7 @@ from pathlib import Path
 from .actions import ActionRequest, SafeActionExecutor, validate_action_approval_matrix
 from .agent_session import (
     build_agent_session_approval_plan,
+    build_agent_session_approval_readiness_queue,
     build_agent_session_completion_audit,
     build_agent_session_real_gate_ledger,
     build_ui_flow_candidate_approval_plan,
@@ -1036,6 +1037,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not write a fresh supervision status artifact before the ledger.",
     )
 
+    agent_session_approval_queue = sub.add_parser(
+        "agent-session-approval-readiness-queue",
+        help="List concrete approval-ready items without exposing tokens or executing actions.",
+    )
+    agent_session_approval_queue.add_argument("--artifact-root", default="")
+    agent_session_approval_queue.add_argument("--max-artifacts", type=int, default=500)
+    agent_session_approval_queue.add_argument("--limit", type=int, default=20)
+
     agent_session_refresh = sub.add_parser(
         "agent-session-evidence-refresh",
         help="Run all read-only evidence collectors for the broad Revit-agent goal and write a fresh completion audit.",
@@ -1256,6 +1265,7 @@ _STDOUT_REDACTED_APPROVAL_COMMANDS = {
     "agent-session-resume-plan",
     "agent-session-completion-audit",
     "agent-session-real-gate-ledger",
+    "agent-session-approval-readiness-queue",
     "agent-session-evidence-refresh",
     "agent-ui-flow-scout",
     "agent-ui-flow-approval-plan",
@@ -2404,6 +2414,16 @@ def dispatch(args: argparse.Namespace) -> dict:
                 max_artifacts=args.max_artifacts,
                 target_hours=args.target_hours,
                 refresh_supervision_status=not args.no_refresh_supervision_status,
+            ),
+            "journal": journal.describe(),
+        }
+    elif command == "agent-session-approval-readiness-queue":
+        return {
+            **build_agent_session_approval_readiness_queue(
+                journal,
+                artifact_root=Path(args.artifact_root) if args.artifact_root else None,
+                max_artifacts=args.max_artifacts,
+                limit=args.limit,
             ),
             "journal": journal.describe(),
         }

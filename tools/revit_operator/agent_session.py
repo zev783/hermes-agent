@@ -743,6 +743,99 @@ def build_agent_session_real_gate_ledger(
     return sanitized
 
 
+def build_agent_session_approval_readiness_queue(
+    journal: TaskJournal,
+    *,
+    artifact_root: Path | None = None,
+    max_artifacts: int = 500,
+    limit: int = 20,
+) -> dict:
+    """List concrete approval-ready items without exposing tokens or executing actions."""
+
+    started_at = utc_now()
+    root = artifact_root or journal.sandbox
+    path_error = validate_output_path(root, journal.sandbox)
+    if path_error:
+        return {
+            "success": False,
+            "error": path_error,
+            "goal_complete": False,
+            "may_call_update_goal": False,
+            "may_execute_from_this_result": False,
+        }
+
+    inventory = _completion_artifact_inventory(root, journal.sandbox, max_artifacts=max_artifacts)
+    artifacts = inventory.pop("_loaded_artifacts", [])
+    materials = _approval_readiness_materials(artifacts, limit=max(0, limit), sandbox=journal.sandbox)
+    items = [item for material in materials for item in material.get("items", [])]
+    output = journal.run_dir / "agent_session_approval_readiness_queue.json"
+    md_path = journal.run_dir / "agent_session_approval_readiness_queue.md"
+    result = {
+        "success": True,
+        "read_only": True,
+        "planned_only": True,
+        "label": DRAFT_LABEL,
+        "schema": "hermes-revit-agent-session-approval-readiness-queue/v1",
+        "created_at": started_at,
+        "artifact_root": str(root),
+        "status": "ready_items_found" if items else "no_approval_items_found",
+        "reason": (
+            "Concrete approval items are available for fresh dry-run and human-confirmed execution."
+            if items
+            else "No private approval material with approval items was found in the scanned artifacts."
+        ),
+        "material_count": len(materials),
+        "ready_item_count": len(items),
+        "materials": materials,
+        "ready_items": items[: max(0, limit)],
+        "execution_guard": {
+            "may_execute_from_this_result": False,
+            "approval_tokens_included": False,
+            "approval_phrases_included": False,
+            "private_approval_material_paths_included": True,
+            "private_approval_material_payloads_included": False,
+            "requires_fresh_human_confirmation_for_execution": True,
+            "requires_fresh_pre_action_observation": True,
+        },
+        "next_step_policy": {
+            "dry_run_allowed_from_queue": True,
+            "execution_requires_execute_flag": True,
+            "execution_requires_exact_human_confirmation": True,
+            "agent_must_not_self_supply_confirmation": True,
+        },
+        "goal_complete": False,
+        "completion_allowed": False,
+        "may_call_update_goal": False,
+        "path": str(output),
+        "markdown_path": str(md_path),
+        "output_files": [str(output), str(md_path)],
+        "journal": journal.describe(),
+    }
+    sanitized = _without_approval_tokens(result)
+    _write_json(output, journal.sandbox, sanitized)
+    _write_text(md_path, journal.sandbox, _approval_readiness_queue_markdown(sanitized))
+    journal.write_entry(
+        {
+            "command": "agent-session-approval-readiness-queue",
+            "requested_action": {
+                "artifact_root": str(root),
+                "max_artifacts": max_artifacts,
+                "limit": limit,
+            },
+            "risk_classification": classify_action("agent-session-approval-readiness-queue", {}).to_dict(),
+            "approval_status": {"allowed": True, "reason": "Read-only approval queue only."},
+            "result": {
+                "status": result["status"],
+                "ready_item_count": len(items),
+                "goal_complete": False,
+                "may_execute_from_this_result": False,
+            },
+            "output_files": result["output_files"],
+        }
+    )
+    return sanitized
+
+
 def refresh_agent_session_evidence(
     journal: TaskJournal,
     observer: RevitWindowObserver,
@@ -2798,6 +2891,7 @@ def _completion_hard_gates(artifacts: list[dict], *, target_hours: float) -> lis
 def _completion_next_commands(objective: str, *, target_hours: float) -> list[str]:
     return [
         _command(["agent-session-evidence-refresh", "--objective", objective, "--target-hours", str(target_hours)]),
+        _command(["agent-session-approval-readiness-queue"]),
         _command(["agent-session-supervision-status", "--target-hours", str(target_hours)]),
         _command(["agent-session-checkpoint", "--objective", objective]),
         _command(["agent-session-resume-plan", "--checkpoint", "<agent_session_checkpoint.json>"]),
@@ -2863,6 +2957,11 @@ def _real_gate_next_readonly_actions(gate: dict, *, objective: str, target_hours
     if gate_id == "arbitrary-ui-live-execution":
         return [
             _gate_action(
+                "list-approval-ready-items",
+                _command(["agent-session-approval-readiness-queue"]),
+                "List concrete approval-ready UI items without exposing tokens or executing actions.",
+            ),
+            _gate_action(
                 "refresh-ui-candidates",
                 _command(["agent-ui-flow-scout", "--objective", objective, "--include-uia"]),
                 "Refresh the live UI candidate list before any human-approved UI action.",
@@ -2883,6 +2982,11 @@ def _real_gate_next_readonly_actions(gate: dict, *, objective: str, target_hours
         ]
     if gate_id == "approved-model-change-live-execution":
         return [
+            _gate_action(
+                "list-approval-ready-items",
+                _command(["agent-session-approval-readiness-queue"]),
+                "List concrete approval-ready model-change items without exposing tokens or executing actions.",
+            ),
             _gate_action(
                 "refresh-model-change-approval-plan",
                 _command(["agent-session-approval-plan", "--objective", objective]),
@@ -2906,6 +3010,11 @@ def _real_gate_next_readonly_actions(gate: dict, *, objective: str, target_hours
         ]
     if gate_id == "model-open-full-prompt-and-ready":
         return [
+            _gate_action(
+                "list-approval-ready-items",
+                _command(["agent-session-approval-readiness-queue"]),
+                "List concrete approval-ready model-open prompt items without exposing tokens or executing actions.",
+            ),
             _gate_action(
                 "observe-model-open-choreography",
                 _command(
@@ -2987,6 +3096,133 @@ def _supervision_status_summary(status: dict | None) -> dict:
         "total_live_hours": audit.get("total_live_hours"),
         "qualifying_log_count": audit.get("qualifying_log_count"),
     }
+
+
+def _approval_readiness_materials(artifacts: list[dict], *, limit: int, sandbox: Path) -> list[dict]:
+    materials: list[dict] = []
+    remaining = max(0, limit)
+    for artifact in artifacts:
+        if remaining <= 0:
+            break
+        payload = artifact["payload"]
+        schema = artifact.get("schema") or ""
+        approval_items = payload.get("approval_items") if isinstance(payload.get("approval_items"), list) else []
+        if not approval_items:
+            continue
+        material_kind = _approval_material_kind(schema)
+        if not material_kind:
+            continue
+        items = []
+        for index, item in enumerate(approval_items):
+            if remaining <= 0:
+                break
+            if not isinstance(item, dict):
+                continue
+            queue_item = _approval_readiness_item(
+                item,
+                material_path=artifact["path"],
+                material_schema=schema,
+                material_kind=material_kind,
+                index=index,
+            )
+            if queue_item:
+                items.append(queue_item)
+                remaining -= 1
+        if items:
+            materials.append(
+                {
+                    "path": str(artifact["path"]),
+                    "relative_path": _safe_relative_path(artifact["path"], sandbox),
+                    "schema": schema,
+                    "kind": material_kind,
+                    "created_at": payload.get("created_at"),
+                    "source_path": payload.get("source_scout_path") or payload.get("source_choreography_path"),
+                    "source_status": payload.get("source_scout_status") or payload.get("source_choreography_status"),
+                    "objective": payload.get("objective"),
+                    "ready_item_count": len(items),
+                    "items": items,
+                    "private_payload_withheld": True,
+                }
+            )
+    return materials
+
+
+def _approval_material_kind(schema: str) -> str:
+    if schema == "hermes-revit-agent-ui-flow-approval-material/v1":
+        return "ui-flow-candidate"
+    if schema == "hermes-revit-agent-session-approval-material/v1":
+        return "agent-session-item"
+    if schema == "hermes-revit-model-open-prompt-approval-material/v1":
+        return "model-open-prompt"
+    return ""
+
+
+def _approval_readiness_item(
+    item: dict,
+    *,
+    material_path: Path,
+    material_schema: str,
+    material_kind: str,
+    index: int,
+) -> dict | None:
+    item_id = str(item.get("id") or "")
+    if not item_id:
+        return None
+    base = {
+        "id": item_id,
+        "kind": item.get("kind") or material_kind,
+        "material_kind": material_kind,
+        "material_schema": material_schema,
+        "material_path": str(material_path),
+        "index": index,
+        "target": item.get("target"),
+        "operation": item.get("operation"),
+        "risk": item.get("risk"),
+        "requires_human_confirmation": True,
+        "confirmation_phrase_withheld": True,
+        "approval_token_withheld": bool(item.get("approval_token")),
+        "may_execute_from_this_result": False,
+        "requires_fresh_pre_action_observation": True,
+    }
+    if material_kind == "ui-flow-candidate":
+        base["dry_run_command"] = _command(
+            [
+                "agent-ui-flow-execute-approved-candidate",
+                "--approval-material",
+                str(material_path),
+                "--item-id",
+                item_id,
+            ]
+        )
+    elif material_kind == "agent-session-item":
+        base["dry_run_command"] = _command(
+            [
+                "agent-session-execute-approved-item",
+                "--approval-material",
+                str(material_path),
+                "--item-id",
+                item_id,
+                "--bridge-refresh-timeout",
+                "0",
+            ]
+        )
+    elif material_kind == "model-open-prompt":
+        base["dry_run_command"] = _command(
+            [
+                "agent-model-open-execute-approved-prompt",
+                "--approval-material",
+                str(material_path),
+                "--item-id",
+                item_id,
+            ]
+        )
+    else:
+        return None
+    check = _completion_command_check(str(base["dry_run_command"]))
+    base["dry_run_read_only"] = check["read_only"]
+    base["dry_run_contains_execute_flag"] = check["contains_execute_flag"]
+    base["dry_run_contains_approval_token"] = check["contains_approval_token"]
+    return base
 
 
 def _artifacts_by_schema(artifacts: list[dict], *schemas: str) -> list[dict]:
@@ -3702,6 +3938,51 @@ def _real_gate_ledger_markdown(result: dict) -> str:
         "approval_tokens_included",
         "approval_phrases_included",
         "private_approval_material_withheld",
+        "requires_fresh_human_confirmation_for_execution",
+        "requires_fresh_pre_action_observation",
+    ):
+        lines.append(f"- {key}: `{str(guard.get(key)).lower()}`")
+    return "\n".join(lines) + "\n"
+
+
+def _approval_readiness_queue_markdown(result: dict) -> str:
+    guard = result.get("execution_guard") if isinstance(result.get("execution_guard"), dict) else {}
+    lines = [
+        "# Revit Agent Approval Readiness Queue",
+        "",
+        DRAFT_LABEL,
+        "",
+        f"Status: `{result.get('status')}`",
+        f"Ready item count: `{result.get('ready_item_count')}`",
+        "Goal complete: `false`",
+        f"May call update_goal: `{str(result.get('may_call_update_goal')).lower()}`",
+        f"May execute from this result: `{str(guard.get('may_execute_from_this_result')).lower()}`",
+        f"Reason: {result.get('reason')}",
+        "",
+        "## Ready Items",
+        "",
+    ]
+    for item in result.get("ready_items", []):
+        label = item.get("target") or item.get("operation") or item.get("kind")
+        lines.append(
+            f"- `{item.get('id')}`: kind=`{item.get('material_kind')}` "
+            f"label=`{label}` dry_run_read_only=`{str(item.get('dry_run_read_only')).lower()}`"
+        )
+    if not result.get("ready_items"):
+        lines.append("- None.")
+    lines.extend(["", "## Material Files", ""])
+    for material in result.get("materials", []):
+        lines.append(
+            f"- `{material.get('relative_path') or material.get('path')}`: "
+            f"kind=`{material.get('kind')}` items=`{material.get('ready_item_count')}`"
+        )
+    if not result.get("materials"):
+        lines.append("- None.")
+    lines.extend(["", "## Execution Guard", ""])
+    for key in (
+        "approval_tokens_included",
+        "approval_phrases_included",
+        "private_approval_material_payloads_included",
         "requires_fresh_human_confirmation_for_execution",
         "requires_fresh_pre_action_observation",
     ):

@@ -1919,6 +1919,7 @@ def test_process_and_wait_observation_actions_are_allowed():
     assert classify_action("supervision-endurance-audit").decision == "allow"
     assert classify_action("agent-session-supervision-status").decision == "allow"
     assert classify_action("agent-session-real-gate-ledger").decision == "allow"
+    assert classify_action("agent-session-approval-readiness-queue").decision == "allow"
     assert classify_action("recovery-drill-matrix").decision == "allow"
     assert classify_action("workflow-approval-plan").decision == "allow"
     assert classify_action(
@@ -23559,6 +23560,132 @@ def test_cli_exposes_agent_session_real_gate_ledger_with_redacted_stdout(tmp_pat
     assert output["may_call_update_goal"] is False
     assert output["execution_guard"]["may_execute_from_this_result"] is False
     assert "APPROVE:cli-secret" not in stdout
+
+
+def test_agent_session_approval_readiness_queue_lists_items_without_tokens(tmp_path):
+    run_dir = tmp_path / "revit_operator_runs" / "approval-materials"
+    run_dir.mkdir(parents=True)
+    (run_dir / "agent_ui_flow_approval_private_material.json").write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-agent-ui-flow-approval-material/v1",
+                "created_at": "2026-05-19T00:00:00Z",
+                "source_scout_path": str(run_dir / "agent_ui_flow_scout.json"),
+                "approval_items": [
+                    {
+                        "id": "ui-candidate:7:worksets",
+                        "kind": "ui-candidate-control",
+                        "target": "Worksets",
+                        "risk": "high",
+                        "approval_token": "APPROVE:ui-secret",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "agent_session_approval_private_material.json").write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-agent-session-approval-material/v1",
+                "created_at": "2026-05-19T00:00:01Z",
+                "objective": "reload links",
+                "approval_items": [
+                    {
+                        "id": "model-change:reload-links",
+                        "kind": "model-change-operation",
+                        "operation": "reload-links",
+                        "approval_token": "APPROVE:model-secret",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "model_open_prompt_approval_private_material.json").write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-model-open-prompt-approval-material/v1",
+                "created_at": "2026-05-19T00:00:02Z",
+                "source_choreography_path": str(run_dir / "model_open_choreography.json"),
+                "approval_items": [
+                    {
+                        "id": "prompt:0:0:ok",
+                        "kind": "model-open-prompt",
+                        "target": "OK",
+                        "approval_token": "APPROVE:prompt-secret",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = agent_session.build_agent_session_approval_readiness_queue(
+        TaskJournal(tmp_path, "agent-session-approval-readiness-queue-test")
+    )
+
+    assert result["success"] is True
+    assert result["read_only"] is True
+    assert result["status"] == "ready_items_found"
+    assert result["ready_item_count"] == 3
+    assert result["goal_complete"] is False
+    assert result["may_call_update_goal"] is False
+    assert result["execution_guard"]["may_execute_from_this_result"] is False
+    assert result["execution_guard"]["approval_tokens_included"] is False
+    assert result["execution_guard"]["approval_phrases_included"] is False
+    commands = [item["dry_run_command"] for item in result["ready_items"]]
+    assert any(command.startswith("agent-ui-flow-execute-approved-candidate") for command in commands)
+    assert any(command.startswith("agent-session-execute-approved-item") for command in commands)
+    assert any(command.startswith("agent-model-open-execute-approved-prompt") for command in commands)
+    assert all("--execute" not in command for command in commands)
+    assert all("APPROVE:" not in command for command in commands)
+    assert "APPROVE:" not in json.dumps(result)
+    assert "I approve" not in json.dumps(result)
+    assert (TaskJournal(tmp_path, "agent-session-approval-readiness-queue-test").run_dir / "agent_session_approval_readiness_queue.json").exists()
+
+
+def test_cli_exposes_agent_session_approval_readiness_queue_with_redacted_stdout(tmp_path, capsys):
+    run_dir = tmp_path / "revit_operator_runs" / "cli-approval-materials"
+    run_dir.mkdir(parents=True)
+    (run_dir / "agent_session_approval_private_material.json").write_text(
+        json.dumps(
+            {
+                "schema": "hermes-revit-agent-session-approval-material/v1",
+                "approval_items": [
+                    {
+                        "id": "model-change:reload-links",
+                        "kind": "model-change-operation",
+                        "operation": "reload-links",
+                        "approval_token": "APPROVE:cli-secret",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "agent-session-approval-readiness-queue-cli-test",
+            "agent-session-approval-readiness-queue",
+        ]
+    )
+
+    assert code == 0
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
+    assert output["success"] is True
+    assert output["ready_item_count"] == 1
+    assert output["goal_complete"] is False
+    assert output["may_call_update_goal"] is False
+    assert output["execution_guard"]["may_execute_from_this_result"] is False
+    assert "APPROVE:cli-secret" not in stdout
+    assert "I approve" not in stdout
 
 
 def test_agent_session_evidence_refresh_runs_readonly_collectors(tmp_path):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .actions import ActionRequest, SafeActionExecutor
@@ -749,6 +750,7 @@ def build_agent_session_approval_readiness_queue(
     artifact_root: Path | None = None,
     max_artifacts: int = 500,
     limit: int = 20,
+    fresh_minutes: float = 120.0,
 ) -> dict:
     """List concrete approval-ready items without exposing tokens or executing actions."""
 
@@ -766,8 +768,18 @@ def build_agent_session_approval_readiness_queue(
 
     inventory = _completion_artifact_inventory(root, journal.sandbox, max_artifacts=max_artifacts)
     artifacts = inventory.pop("_loaded_artifacts", [])
-    materials = _approval_readiness_materials(artifacts, limit=max(0, limit), sandbox=journal.sandbox)
+    now = datetime.now(timezone.utc)
+    materials = _approval_readiness_materials(
+        artifacts,
+        limit=max(0, limit),
+        sandbox=journal.sandbox,
+        fresh_minutes=max(0.0, fresh_minutes),
+        now=now,
+    )
     items = [item for material in materials for item in material.get("items", [])]
+    recommended_items = _approval_recommended_items(items, limit=min(max(0, limit), 10))
+    fresh_items = [item for item in items if item.get("fresh")]
+    stale_items = [item for item in items if not item.get("fresh")]
     output = journal.run_dir / "agent_session_approval_readiness_queue.json"
     md_path = journal.run_dir / "agent_session_approval_readiness_queue.md"
     result = {
@@ -784,10 +796,15 @@ def build_agent_session_approval_readiness_queue(
             if items
             else "No private approval material with approval items was found in the scanned artifacts."
         ),
+        "fresh_minutes": max(0.0, fresh_minutes),
         "material_count": len(materials),
         "ready_item_count": len(items),
+        "fresh_item_count": len(fresh_items),
+        "stale_item_count": len(stale_items),
+        "recommended_item_count": len(recommended_items),
         "materials": materials,
         "ready_items": items[: max(0, limit)],
+        "recommended_items": recommended_items,
         "execution_guard": {
             "may_execute_from_this_result": False,
             "approval_tokens_included": False,
@@ -821,6 +838,7 @@ def build_agent_session_approval_readiness_queue(
                 "artifact_root": str(root),
                 "max_artifacts": max_artifacts,
                 "limit": limit,
+                "fresh_minutes": fresh_minutes,
             },
             "risk_classification": classify_action("agent-session-approval-readiness-queue", {}).to_dict(),
             "approval_status": {"allowed": True, "reason": "Read-only approval queue only."},
@@ -2527,6 +2545,7 @@ def _completion_artifact_inventory(root: Path, sandbox: Path, *, max_artifacts: 
             "payload": payload,
             "schema": _completion_artifact_schema(path, payload),
             "bytes": size,
+            "mtime": _mtime,
         }
         loaded.append(artifact)
         summaries.append(_completion_artifact_summary(artifact, sandbox))
@@ -3098,7 +3117,14 @@ def _supervision_status_summary(status: dict | None) -> dict:
     }
 
 
-def _approval_readiness_materials(artifacts: list[dict], *, limit: int, sandbox: Path) -> list[dict]:
+def _approval_readiness_materials(
+    artifacts: list[dict],
+    *,
+    limit: int,
+    sandbox: Path,
+    fresh_minutes: float,
+    now: datetime,
+) -> list[dict]:
     materials: list[dict] = []
     remaining = max(0, limit)
     for artifact in artifacts:
@@ -3112,6 +3138,11 @@ def _approval_readiness_materials(artifacts: list[dict], *, limit: int, sandbox:
         material_kind = _approval_material_kind(schema)
         if not material_kind:
             continue
+        material_created_at = payload.get("created_at")
+        material_time = _approval_material_time(artifact, material_created_at)
+        material_age_minutes = _age_minutes(material_time, now)
+        material_fresh = material_age_minutes is None or material_age_minutes <= fresh_minutes
+        source_context = _approval_source_context(artifact["path"])
         items = []
         for index, item in enumerate(approval_items):
             if remaining <= 0:
@@ -3124,6 +3155,10 @@ def _approval_readiness_materials(artifacts: list[dict], *, limit: int, sandbox:
                 material_schema=schema,
                 material_kind=material_kind,
                 index=index,
+                material_created_at=material_created_at,
+                material_age_minutes=material_age_minutes,
+                material_fresh=material_fresh,
+                source_context=source_context,
             )
             if queue_item:
                 items.append(queue_item)
@@ -3135,7 +3170,12 @@ def _approval_readiness_materials(artifacts: list[dict], *, limit: int, sandbox:
                     "relative_path": _safe_relative_path(artifact["path"], sandbox),
                     "schema": schema,
                     "kind": material_kind,
-                    "created_at": payload.get("created_at"),
+                    "created_at": material_created_at,
+                    "file_mtime_utc": _format_epoch_utc(artifact.get("mtime")),
+                    "age_minutes": material_age_minutes,
+                    "fresh": material_fresh,
+                    "stale_reason": None if material_fresh else f"Approval material is older than {fresh_minutes:g} minutes.",
+                    "source_context": source_context,
                     "source_path": payload.get("source_scout_path") or payload.get("source_choreography_path"),
                     "source_status": payload.get("source_scout_status") or payload.get("source_choreography_status"),
                     "objective": payload.get("objective"),
@@ -3164,6 +3204,10 @@ def _approval_readiness_item(
     material_schema: str,
     material_kind: str,
     index: int,
+    material_created_at: str | None,
+    material_age_minutes: float | None,
+    material_fresh: bool,
+    source_context: str,
 ) -> dict | None:
     item_id = str(item.get("id") or "")
     if not item_id:
@@ -3175,6 +3219,11 @@ def _approval_readiness_item(
         "material_schema": material_schema,
         "material_path": str(material_path),
         "index": index,
+        "material_created_at": material_created_at,
+        "material_age_minutes": material_age_minutes,
+        "fresh": material_fresh,
+        "source_context": source_context,
+        "stale_reason": None if material_fresh else "Approval material is stale; refresh the approval plan before execution.",
         "target": item.get("target"),
         "operation": item.get("operation"),
         "risk": item.get("risk"),
@@ -3223,6 +3272,92 @@ def _approval_readiness_item(
     base["dry_run_contains_execute_flag"] = check["contains_execute_flag"]
     base["dry_run_contains_approval_token"] = check["contains_approval_token"]
     return base
+
+
+def _approval_recommended_items(items: list[dict], *, limit: int) -> list[dict]:
+    ranked = sorted(items, key=_approval_recommendation_sort_key)
+    seen: set[tuple[str, str, str]] = set()
+    recommendations = []
+    for item in ranked:
+        key = _approval_item_recommendation_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        recommendation = dict(item)
+        recommendation["recommendation_rank"] = len(recommendations) + 1
+        recommendation["recommendation_reason"] = _approval_recommendation_reason(item)
+        recommendations.append(recommendation)
+        if len(recommendations) >= limit:
+            break
+    return recommendations
+
+
+def _approval_recommendation_sort_key(item: dict) -> tuple[int, int, float, str]:
+    age = item.get("material_age_minutes")
+    age_value = float(age) if isinstance(age, (int, float)) else 1_000_000.0
+    source_penalty = 1 if item.get("source_context") == "synthetic_or_smoke" else 0
+    fresh_penalty = 0 if item.get("fresh") else 1
+    return (fresh_penalty, source_penalty, age_value, str(item.get("id") or ""))
+
+
+def _approval_item_recommendation_key(item: dict) -> tuple[str, str, str]:
+    return (
+        str(item.get("material_kind") or ""),
+        str(item.get("kind") or ""),
+        str(item.get("operation") or item.get("target") or item.get("id") or ""),
+    )
+
+
+def _approval_recommendation_reason(item: dict) -> str:
+    if not item.get("fresh"):
+        return "Stale item retained for traceability; refresh approval material before using it."
+    if item.get("source_context") == "synthetic_or_smoke":
+        return "Synthetic/smoke item retained for testing evidence; prefer live approval material for real Revit work."
+    return "Fresh live approval material; still requires dry-run, exact human confirmation, and fresh observation before execution."
+
+
+def _approval_material_time(artifact: dict, created_at: object) -> datetime | None:
+    parsed = _parse_utc_datetime(created_at)
+    if parsed:
+        return parsed
+    mtime = artifact.get("mtime")
+    if isinstance(mtime, (int, float)):
+        return datetime.fromtimestamp(float(mtime), timezone.utc)
+    return None
+
+
+def _parse_utc_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _age_minutes(then: datetime | None, now: datetime) -> float | None:
+    if then is None:
+        return None
+    return max(0.0, (now - then).total_seconds() / 60.0)
+
+
+def _format_epoch_utc(value: object) -> str | None:
+    if not isinstance(value, (int, float)):
+        return None
+    return datetime.fromtimestamp(float(value), timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _approval_source_context(path: Path) -> str:
+    text = str(path).lower()
+    if "smoke" in text or "synthetic" in text:
+        return "synthetic_or_smoke"
+    return "live_or_user_generated"
 
 
 def _artifacts_by_schema(artifacts: list[dict], *schemas: str) -> list[dict]:
@@ -3954,6 +4089,8 @@ def _approval_readiness_queue_markdown(result: dict) -> str:
         "",
         f"Status: `{result.get('status')}`",
         f"Ready item count: `{result.get('ready_item_count')}`",
+        f"Fresh item count: `{result.get('fresh_item_count')}`",
+        f"Recommended item count: `{result.get('recommended_item_count')}`",
         "Goal complete: `false`",
         f"May call update_goal: `{str(result.get('may_call_update_goal')).lower()}`",
         f"May execute from this result: `{str(guard.get('may_execute_from_this_result')).lower()}`",
@@ -3962,13 +4099,14 @@ def _approval_readiness_queue_markdown(result: dict) -> str:
         "## Ready Items",
         "",
     ]
-    for item in result.get("ready_items", []):
+    for item in result.get("recommended_items", []):
         label = item.get("target") or item.get("operation") or item.get("kind")
         lines.append(
             f"- `{item.get('id')}`: kind=`{item.get('material_kind')}` "
-            f"label=`{label}` dry_run_read_only=`{str(item.get('dry_run_read_only')).lower()}`"
+            f"label=`{label}` fresh=`{str(item.get('fresh')).lower()}` "
+            f"source=`{item.get('source_context')}` dry_run_read_only=`{str(item.get('dry_run_read_only')).lower()}`"
         )
-    if not result.get("ready_items"):
+    if not result.get("recommended_items"):
         lines.append("- None.")
     lines.extend(["", "## Material Files", ""])
     for material in result.get("materials", []):

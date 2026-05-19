@@ -1044,6 +1044,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_session_approval_queue.add_argument("--artifact-root", default="")
     agent_session_approval_queue.add_argument("--max-artifacts", type=int, default=500)
     agent_session_approval_queue.add_argument("--limit", type=int, default=20)
+    agent_session_approval_queue.add_argument("--fresh-minutes", type=float, default=120.0)
 
     agent_session_refresh = sub.add_parser(
         "agent-session-evidence-refresh",
@@ -2424,6 +2425,7 @@ def dispatch(args: argparse.Namespace) -> dict:
                 artifact_root=Path(args.artifact_root) if args.artifact_root else None,
                 max_artifacts=args.max_artifacts,
                 limit=args.limit,
+                fresh_minutes=args.fresh_minutes,
             ),
             "journal": journal.describe(),
         }

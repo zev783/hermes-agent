@@ -23629,6 +23629,8 @@ def test_agent_session_approval_readiness_queue_lists_items_without_tokens(tmp_p
     assert result["read_only"] is True
     assert result["status"] == "ready_items_found"
     assert result["ready_item_count"] == 3
+    assert result["fresh_item_count"] == 3
+    assert result["recommended_item_count"] == 3
     assert result["goal_complete"] is False
     assert result["may_call_update_goal"] is False
     assert result["execution_guard"]["may_execute_from_this_result"] is False
@@ -23640,9 +23642,56 @@ def test_agent_session_approval_readiness_queue_lists_items_without_tokens(tmp_p
     assert any(command.startswith("agent-model-open-execute-approved-prompt") for command in commands)
     assert all("--execute" not in command for command in commands)
     assert all("APPROVE:" not in command for command in commands)
+    assert all(item["fresh"] is True for item in result["recommended_items"])
+    assert all(item["source_context"] == "live_or_user_generated" for item in result["recommended_items"])
     assert "APPROVE:" not in json.dumps(result)
     assert "I approve" not in json.dumps(result)
     assert (TaskJournal(tmp_path, "agent-session-approval-readiness-queue-test").run_dir / "agent_session_approval_readiness_queue.json").exists()
+
+
+def test_agent_session_approval_readiness_queue_prefers_fresh_live_material(tmp_path):
+    live_dir = tmp_path / "revit_operator_runs" / "agent-session-approval-live"
+    smoke_dir = tmp_path / "revit_operator_runs" / "agent-session-approval-smoke"
+    live_dir.mkdir(parents=True)
+    smoke_dir.mkdir(parents=True)
+    fresh_now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    for directory, created_at, token in (
+        (live_dir, fresh_now, "APPROVE:live-secret"),
+        (smoke_dir, "2020-01-01T00:00:00Z", "APPROVE:stale-secret"),
+    ):
+        (directory / "agent_session_approval_private_material.json").write_text(
+            json.dumps(
+                {
+                    "schema": "hermes-revit-agent-session-approval-material/v1",
+                    "created_at": created_at,
+                    "objective": "reload links",
+                    "approval_items": [
+                        {
+                            "id": "model-change:reload-links",
+                            "kind": "model-change-operation",
+                            "operation": "reload-links",
+                            "approval_token": token,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    result = agent_session.build_agent_session_approval_readiness_queue(
+        TaskJournal(tmp_path, "agent-session-approval-readiness-fresh-test"),
+        fresh_minutes=60,
+    )
+
+    assert result["ready_item_count"] == 2
+    assert result["fresh_item_count"] == 1
+    assert result["stale_item_count"] == 1
+    assert result["recommended_items"][0]["operation"] == "reload-links"
+    assert "agent-session-approval-live" in result["recommended_items"][0]["material_path"]
+    assert result["recommended_items"][0]["fresh"] is True
+    assert result["recommended_items"][0]["source_context"] == "live_or_user_generated"
+    assert any(item["source_context"] == "synthetic_or_smoke" for item in result["ready_items"])
+    assert "APPROVE:" not in json.dumps(result)
 
 
 def test_cli_exposes_agent_session_approval_readiness_queue_with_redacted_stdout(tmp_path, capsys):

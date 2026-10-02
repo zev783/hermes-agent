@@ -1,0 +1,6 @@
+name: revit-operator
+version: 0.1.0
+description: "Hermes tool wrapper for the local Revit Human-Operator Layer CLI. Routes calls through the existing safety-gated revit-operator dispatcher."
+author: "Hermes"
+tools:
+  - revit_operator

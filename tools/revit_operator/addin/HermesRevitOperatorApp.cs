@@ -72,6 +72,34 @@ public class HermesRevitOperatorApp : IExternalApplication
     // queued shortly before launch (queue, then open the model) still runs.
     private static readonly TimeSpan QueueReplayGrace = TimeSpan.FromMinutes(15);
 
+    // Every Revit with the add-in polls the same queue, so a queued line can name the process it is for:
+    // "target": {"process_id": <pid>, "process_start_utc": <ISO 8601>}. Other processes skip it without reporting.
+    // Untargeted lines still run in every session, except operations that change a model or the open documents,
+    // which are refused untargeted. Hermes's request-operation requires a target for the same operations
+    // (operations.TARGET_REQUIRED_OPERATIONS).
+    private static readonly HashSet<string> TargetRequiredOperations = new(StringComparer.Ordinal)
+    {
+        "open-model",
+        "close-model",
+        "save",
+        "sync",
+        "synchronize-with-central",
+        "reload-links",
+        "modify-model",
+        "set-project-info-parameter"
+    };
+    // Windows reuses the ids of exited processes, so a target also names its process's start time.
+    private const double ProcessStartToleranceSeconds = 2.0;
+
+    private enum CommandTargetMatch
+    {
+        Untargeted,
+        ThisProcess,
+        OtherProcess,
+        EarlierProcess,
+        Invalid
+    }
+
     // A thread-pool timer sweeps the bridge folder for temp files that failed writes left behind and for the
     // per-process status files of exited Revit processes. Files younger than StaleBridgeFileAge are never touched.
     private static readonly TimeSpan StaleBridgeFileAge = TimeSpan.FromMinutes(10);
@@ -332,11 +360,24 @@ public class HermesRevitOperatorApp : IExternalApplication
                 {
                     continue;
                 }
+                var targetMatch = MatchCommandTarget(root);
+                // The Revit the line names runs and reports it; a result from here would answer for that session.
+                if (targetMatch == CommandTargetMatch.OtherProcess)
+                {
+                    continue;
+                }
                 // Without a timestamp, the queue file's last write bounds how recently the line was appended.
                 var queuedAtUtc = GetUtcTimestamp(root, "timestamp") ?? queueWriteUtc;
                 if (queuedAtUtc < staleBeforeUtc)
                 {
                     skippedStale.Add(id);
+                    continue;
+                }
+                var refusal = CommandTargetRefusal(root, targetMatch);
+                if (refusal != null)
+                {
+                    refusal["id"] = id;
+                    AppendResult(refusal);
                     continue;
                 }
                 ExecuteQueuedCommand(uiapp, root, id);
@@ -373,6 +414,7 @@ public class HermesRevitOperatorApp : IExternalApplication
             var result = ExecuteOperation(uiapp, operation, opArgs, allowModelWrite, allowSync);
             result["id"] = id;
             result["operation"] = operation;
+            result["target"] = CommandTargetInfo(root);
             result["timestamp"] = DateTimeOffset.UtcNow.ToString("O");
             result["addin"] = AddinInfo();
             AppendResult(result);
@@ -384,10 +426,100 @@ public class HermesRevitOperatorApp : IExternalApplication
                 ["id"] = id,
                 ["success"] = false,
                 ["error"] = ex.ToString(),
+                ["target"] = CommandTargetInfo(root),
                 ["addin"] = AddinInfo(),
                 ["timestamp"] = DateTimeOffset.UtcNow.ToString("O")
             });
         }
+    }
+
+    private static CommandTargetMatch MatchCommandTarget(JsonElement root)
+    {
+        if (root.ValueKind != JsonValueKind.Object
+            || !root.TryGetProperty("target", out var target)
+            || target.ValueKind == JsonValueKind.Null)
+        {
+            return CommandTargetMatch.Untargeted;
+        }
+        var processId = GetLong(target, "process_id");
+        if (processId is null or <= 0)
+        {
+            return CommandTargetMatch.Invalid;
+        }
+        if (processId.Value != ProcessId)
+        {
+            return CommandTargetMatch.OtherProcess;
+        }
+        if (!target.TryGetProperty("process_start_utc", out var started) || started.ValueKind == JsonValueKind.Null)
+        {
+            return CommandTargetMatch.ThisProcess;
+        }
+        var startedUtc = GetUtcTimestamp(target, "process_start_utc");
+        if (startedUtc == null)
+        {
+            return CommandTargetMatch.Invalid;
+        }
+        return Math.Abs((startedUtc.Value - ProcessStartUtc).TotalSeconds) <= ProcessStartToleranceSeconds
+            ? CommandTargetMatch.ThisProcess
+            : CommandTargetMatch.EarlierProcess;
+    }
+
+    // Returns the failure result for a line this process must not run, or null when it may run it.
+    private Dictionary<string, object?>? CommandTargetRefusal(JsonElement root, CommandTargetMatch match)
+    {
+        var operation = GetString(root, "operation") ?? "";
+        string status;
+        string error;
+        switch (match)
+        {
+            case CommandTargetMatch.Invalid:
+                status = "invalid_target";
+                error = "The command target must be an object with a positive integer process_id and, optionally, "
+                    + "a process_start_utc timestamp.";
+                break;
+            case CommandTargetMatch.EarlierProcess:
+                // The process the line names has exited; no other session will run or answer it.
+                status = "target_process_exited";
+                error = "The command targets an earlier Revit process with id " + ProcessId
+                    + "; this process started at " + ProcessStartUtc.ToString("O") + ".";
+                break;
+            case CommandTargetMatch.Untargeted when TargetRequiredOperations.Contains(operation):
+                status = "target_required";
+                error = "Operation " + operation + " changes a model or the open documents, so it runs only in the "
+                    + "Revit process its queued line names. Queue it with request-operation --hwnd or --pid.";
+                break;
+            default:
+                return null;
+        }
+        return new Dictionary<string, object?>
+        {
+            ["success"] = false,
+            ["status"] = status,
+            ["error"] = error,
+            ["operation"] = operation,
+            ["target"] = CommandTargetInfo(root),
+            ["addin"] = AddinInfo(),
+            ["timestamp"] = DateTimeOffset.UtcNow.ToString("O")
+        };
+    }
+
+    private static object? CommandTargetInfo(JsonElement root)
+    {
+        if (root.ValueKind != JsonValueKind.Object
+            || !root.TryGetProperty("target", out var target)
+            || target.ValueKind == JsonValueKind.Null)
+        {
+            return null;
+        }
+        if (target.ValueKind != JsonValueKind.Object)
+        {
+            return target.GetRawText();
+        }
+        return new Dictionary<string, object?>
+        {
+            ["process_id"] = GetLong(target, "process_id"),
+            ["process_start_utc"] = GetString(target, "process_start_utc")
+        };
     }
 
     private Dictionary<string, object?> ExecuteOperation(
@@ -921,6 +1053,9 @@ public class HermesRevitOperatorApp : IExternalApplication
 
     private void AppendResult(Dictionary<string, object?> payload)
     {
+        // Tandem sessions share the results file. The writer's identity lets Hermes keep only its target's results.
+        payload["process_id"] = ProcessId;
+        payload["process_start_utc"] = ProcessStartUtc.ToString("O");
         Directory.CreateDirectory(BridgeDir);
         AppendLineWithRetry(CommandResultsPath, JsonSerializer.Serialize(payload) + Environment.NewLine);
     }
@@ -980,6 +1115,7 @@ public class HermesRevitOperatorApp : IExternalApplication
             ["process_id"] = ProcessId,
             ["process_start_utc"] = ProcessStartUtc.ToString("O"),
             ["writes_process_status_files"] = true,
+            ["supports_command_targets"] = true,
             ["stale_queue_grace_seconds"] = (int)QueueReplayGrace.TotalSeconds,
             ["loaded_at_utc"] = _loadedAtUtc.ToString("O"),
             ["session_id"] = _sessionId,
@@ -995,7 +1131,8 @@ public class HermesRevitOperatorApp : IExternalApplication
                 "qa-snapshot",
                 "open-model",
                 "activate-view",
-                "guarded-model-write-operations"
+                "guarded-model-write-operations",
+                "command-targets"
             }
         };
     }

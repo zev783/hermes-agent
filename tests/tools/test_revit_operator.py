@@ -1,6 +1,7 @@
 ﻿import asyncio
 import json
 import os
+import re
 import sys
 import threading
 import urllib.error
@@ -19935,14 +19936,15 @@ def test_request_operation_activate_view_execute_writes_bridge_queue_with_exact_
     assert command["guards"]["allow_model_write"] is False
 
 
-def test_request_operation_execute_writes_bridge_queue_with_exact_token(tmp_path, capsys):
+def test_request_operation_execute_writes_bridge_queue_with_exact_token(tmp_path, capsys, monkeypatch):
+    _live_revit_processes(monkeypatch, 222)
+    _start_bridge_session(tmp_path, 222)
     payload = {
         "operation": "set-project-info-parameter",
         "args": {"name": "Project Status", "value": "QA Draft"},
         "allow_model_write": True,
         "allow_sync": False,
     }
-    decision = classify_action("request-operation", payload)
 
     code = cli.main(
         [
@@ -19959,9 +19961,11 @@ def test_request_operation_execute_writes_bridge_queue_with_exact_token(tmp_path
             "--value",
             "QA Draft",
             "--allow-model-write",
+            "--pid",
+            "222",
             "--execute",
             "--approval-token",
-            decision.approval_token,
+            _targeted_token(payload, 222),
         ]
     )
 
@@ -19973,6 +19977,7 @@ def test_request_operation_execute_writes_bridge_queue_with_exact_token(tmp_path
     assert command["operation"] == "set-project-info-parameter"
     assert command["args"]["name"] == "Project Status"
     assert command["guards"]["allow_model_write"] is True
+    assert command["target"] == {"process_id": 222, "process_start_utc": _SESSION_STARTED}
 
 
 def test_bridge_queue_append_retries_transient_permission_error(tmp_path, monkeypatch):
@@ -20001,7 +20006,9 @@ def test_bridge_queue_append_retries_transient_permission_error(tmp_path, monkey
     assert json.loads(queue_path.read_text(encoding="utf-8"))["id"] == "retry-test"
 
 
-def test_request_operation_open_model_validates_and_queues_model_path(tmp_path, capsys):
+def test_request_operation_open_model_validates_and_queues_model_path(tmp_path, capsys, monkeypatch):
+    _live_revit_processes(monkeypatch, 222)
+    _start_bridge_session(tmp_path / "sandbox", 222)
     model = tmp_path / "bridge-open-R25.rvt"
     model.write_text("not a real model", encoding="utf-8")
     args = {
@@ -20015,7 +20022,6 @@ def test_request_operation_open_model_validates_and_queues_model_path(tmp_path, 
         "allow_model_write": False,
         "allow_sync": False,
     }
-    decision = classify_action("request-operation", payload)
 
     code = cli.main(
         [
@@ -20029,9 +20035,11 @@ def test_request_operation_open_model_validates_and_queues_model_path(tmp_path, 
             "open-model",
             "--args-json",
             json.dumps(args),
+            "--pid",
+            "222",
             "--execute",
             "--approval-token",
-            decision.approval_token,
+            _targeted_token(payload, 222),
         ]
     )
 
@@ -20042,6 +20050,7 @@ def test_request_operation_open_model_validates_and_queues_model_path(tmp_path, 
     command = json.loads(queue_path.read_text(encoding="utf-8").splitlines()[-1])
     assert command["operation"] == "open-model"
     assert command["args"]["detach"] is True
+    assert command["target"]["process_id"] == 222
 
 
 def test_install_addin_dry_run_reports_build_prerequisite(tmp_path, capsys):
@@ -20612,6 +20621,47 @@ def _current_bridge_addin(pid: int, *, started: str = "2026-10-02T12:00:00.12345
     }
 
 
+# When _current_bridge_addin says its process started, in the add-in's format and as the live process reports it.
+_SESSION_STARTED = "2026-10-02T12:00:00.1234567Z"
+_SESSION_STARTED_AT = datetime(2026, 10, 2, 12, 0, 0, 123456, tzinfo=timezone.utc)
+
+
+def _start_bridge_session(
+    sandbox: Path,
+    pid: int,
+    *,
+    title: str = "Target Model",
+    honors_targets: bool = True,
+    status: str = "started",
+) -> None:
+    """Write the per-process status files that a running add-in keeps for one Revit process."""
+    addin = _current_bridge_addin(pid)
+    if honors_targets:
+        addin["supports_command_targets"] = True
+    bridge_dir = sandbox / "bridge"
+    _write_bridge_payload(bridge_dir / f"addin_status.{pid}.json", {"status": status, "addin": addin})
+    _write_bridge_payload(bridge_dir / f"addin_heartbeat.{pid}.json", {"status": "idling", "addin": addin})
+    _write_bridge_payload(
+        bridge_dir / f"active_document.{pid}.json",
+        {
+            "available": True,
+            "status": "connected",
+            "document": {"title": title, "path": f"C:/models/{title}.rvt"},
+            "addin": addin,
+        },
+    )
+
+
+def _live_revit_processes(monkeypatch, *pids: int) -> None:
+    """Treat these process ids as running, started when _current_bridge_addin says, and every other id as exited."""
+    monkeypatch.setattr(bridge_module, "_process_start_utc", lambda pid: _SESSION_STARTED_AT if pid in pids else None)
+
+
+def _targeted_token(payload: dict, pid: int, started: str = _SESSION_STARTED) -> str:
+    target = {"process_id": pid, "process_start_utc": started}
+    return classify_action("request-operation", {**payload, "target": target}).approval_token
+
+
 def test_bridge_status_prefers_target_process_files_over_shared_files(tmp_path, monkeypatch):
     monkeypatch.setattr(
         bridge_module,
@@ -20727,6 +20777,304 @@ def test_cli_verify_bridge_build_reads_target_window_process_files(tmp_path, cap
     assert output["status"] == "current"
     assert output["status_source"] == "process"
     assert output["target"] == {"hwnd": 4242, "pid": 222}
+
+
+def _set_parameter_payload() -> dict:
+    return {
+        "operation": "set-project-info-parameter",
+        "args": {"name": "Project Status", "value": "QA Draft"},
+        "allow_model_write": True,
+        "allow_sync": False,
+    }
+
+
+def _set_parameter_argv(sandbox: Path, task_id: str, *extra: str) -> list[str]:
+    return [
+        "--sandbox",
+        str(sandbox),
+        "--allow-sandbox-outside-safe-root",
+        "--task-id",
+        task_id,
+        "request-operation",
+        "--operation",
+        "set-project-info-parameter",
+        "--name",
+        "Project Status",
+        "--value",
+        "QA Draft",
+        "--allow-model-write",
+        *extra,
+    ]
+
+
+def test_request_operation_targets_one_process_and_binds_the_approval_to_it(tmp_path, capsys, monkeypatch):
+    _live_revit_processes(monkeypatch, 222, 333)
+    monkeypatch.setattr(bridge_module, "process_id_for_hwnd", lambda hwnd: {4242: 222}.get(hwnd))
+    _start_bridge_session(tmp_path, 222, title="Target Model")
+    _start_bridge_session(tmp_path, 333, title="Other Agent Model")
+    payload = _set_parameter_payload()
+    token = _targeted_token(payload, 222)
+    queue_path = tmp_path / "bridge" / "command_queue.jsonl"
+
+    assert cli.main(_set_parameter_argv(tmp_path, "target-dry-run", "--hwnd", "4242")) == 0
+    dry_run = json.loads(capsys.readouterr().out)
+    assert dry_run["success"] is True
+    assert dry_run["target"] == {"process_id": 222, "process_start_utc": _SESSION_STARTED}
+    assert dry_run["target_session"]["document"]["title"] == "Target Model"
+    assert dry_run["policy"]["approval_token"] == token
+    assert "--hwnd 4242" in dry_run["next_step"]
+    # An approval for this operation without a target, or for another Revit, does not cover this target.
+    assert token != classify_action("request-operation", payload).approval_token
+    assert token != _targeted_token(payload, 333)
+
+    stale_token = classify_action("request-operation", payload).approval_token
+    assert cli.main(_set_parameter_argv(tmp_path, "target-stale", "--pid", "222", "--execute", "--approval-token", stale_token)) == 2
+    assert "approval token" in json.loads(capsys.readouterr().out)["error"]
+    assert not queue_path.exists()
+
+    assert cli.main(_set_parameter_argv(tmp_path, "target-execute", "--pid", "222", "--execute", "--approval-token", token)) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["queued"] is True
+    command = json.loads(queue_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert command["target"] == {"process_id": 222, "process_start_utc": _SESSION_STARTED}
+    journal_entry = json.loads(
+        (tmp_path / "revit_operator_runs" / "target-execute" / "journal.jsonl").read_text(encoding="utf-8").splitlines()[-1]
+    )
+    assert journal_entry["target"] == command["target"]
+    # Recorded workflows replay requested_action, which never names a process that has since exited.
+    assert "target" not in journal_entry["requested_action"]
+
+
+@pytest.mark.parametrize("operation", sorted(operations.TARGET_REQUIRED_OPERATIONS))
+def test_request_operation_refuses_untargeted_model_and_document_changes(tmp_path, monkeypatch, operation):
+    _live_revit_processes(monkeypatch, 222)
+    _start_bridge_session(tmp_path / "sandbox", 222, title="Target Model")
+    model = tmp_path / "copy-R25.rvt"
+    model.write_text("not a real model", encoding="utf-8")
+    args = {
+        "open-model": {"path": str(model), "allow_model_outside_safe_root": True},
+        "set-project-info-parameter": {"name": "Project Status", "value": "QA Draft"},
+    }.get(operation, {})
+    payload = {"operation": operation, "args": args, "allow_model_write": True, "allow_sync": True}
+    journal = TaskJournal(tmp_path / "sandbox", f"untargeted-{operation}")
+
+    # Every other guard is satisfied, so only the missing target stops the line.
+    result = operations.queue_operation(
+        journal,
+        operations.OperationRequest(
+            operation=operation,
+            args=args,
+            dry_run=False,
+            approval_token=classify_action("request-operation", payload).approval_token,
+            allow_model_write=True,
+            allow_sync=True,
+        ),
+    )
+
+    assert result["success"] is False
+    assert "pass --hwnd or --pid" in result["error"]
+    assert "pid 222 (Target Model)" in result["error"]
+    assert [session["process_id"] for session in result["live_sessions"]] == [222]
+    assert not (tmp_path / "sandbox" / "bridge" / "command_queue.jsonl").exists()
+
+
+def test_request_operation_still_queues_untargeted_read_only_and_view_requests(tmp_path):
+    journal = TaskJournal(tmp_path, "untargeted-compatible")
+    view_payload = {
+        "operation": "activate-view",
+        "args": {"sheet_number": "S2.0"},
+        "allow_model_write": False,
+        "allow_sync": False,
+    }
+
+    active = operations.queue_operation(
+        journal,
+        operations.OperationRequest(operation="active-document", args={}, dry_run=False),
+    )
+    view = operations.queue_operation(
+        journal,
+        operations.OperationRequest(
+            operation="activate-view",
+            args={"sheet_number": "S2.0"},
+            dry_run=False,
+            approval_token=classify_action("request-operation", view_payload).approval_token,
+        ),
+    )
+
+    assert active["queued"] is True and view["queued"] is True
+    assert active["target"] is None
+    lines = (tmp_path / "bridge" / "command_queue.jsonl").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line)["operation"] for line in lines] == ["active-document", "activate-view"]
+    assert all("target" not in json.loads(line) for line in lines)
+
+
+def test_request_operation_refuses_targets_it_cannot_honor(tmp_path, monkeypatch):
+    _live_revit_processes(monkeypatch, 222, 555, 666)
+    monkeypatch.setattr(bridge_module, "process_id_for_hwnd", lambda hwnd: {4242: 222}.get(hwnd))
+    _start_bridge_session(tmp_path, 222)
+    _start_bridge_session(tmp_path, 444)
+    _start_bridge_session(tmp_path, 666, status="stopped")
+    journal = TaskJournal(tmp_path, "unusable-targets")
+
+    def queue(**target):
+        return operations.queue_operation(
+            journal,
+            operations.OperationRequest(operation="active-document", args={}, dry_run=False, **target),
+        )
+
+    assert "is not running" in queue(target_pid=444)["error"]
+    assert "wrote no per-process status files" in queue(target_pid=555)["error"]
+    assert "has stopped" in queue(target_pid=666)["error"]
+    assert "does not exist" in queue(target_hwnd=9999)["error"]
+    assert "belongs to process 222, not process 555" in queue(target_hwnd=4242, target_pid=555)["error"]
+    assert not (tmp_path / "bridge" / "command_queue.jsonl").exists()
+
+
+def test_request_operation_refuses_target_whose_process_id_was_reused(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge_module, "_process_start_utc", lambda pid: datetime(2026, 10, 2, 15, 0, tzinfo=timezone.utc))
+    bridge_dir = tmp_path / "bridge"
+    addin = _current_bridge_addin(222, started="2026-09-30T08:00:00.1234567Z")
+    _write_bridge_payload(bridge_dir / "addin_status.222.json", {"status": "started", "addin": addin})
+
+    result = operations.queue_operation(
+        TaskJournal(tmp_path, "reused-pid"),
+        operations.OperationRequest(operation="active-document", args={}, dry_run=False, target_pid=222),
+    )
+
+    assert result["success"] is False
+    assert "earlier process" in result["error"]
+    assert not (bridge_dir / "command_queue.jsonl").exists()
+
+
+def test_request_operation_refuses_targeted_change_while_a_session_ignores_targets(tmp_path, monkeypatch):
+    _live_revit_processes(monkeypatch, 222, 333)
+    _start_bridge_session(tmp_path, 222)
+    # 333 runs the build before command targets, which runs every queued line; 444 runs it too but has exited.
+    _start_bridge_session(tmp_path, 333, honors_targets=False)
+    _start_bridge_session(tmp_path, 444, honors_targets=False)
+    journal = TaskJournal(tmp_path, "ignoring-session")
+    payload = _set_parameter_payload()
+
+    change = operations.queue_operation(
+        journal,
+        operations.OperationRequest(
+            operation="set-project-info-parameter",
+            args=payload["args"],
+            dry_run=False,
+            approval_token=_targeted_token(payload, 222),
+            allow_model_write=True,
+            target_pid=222,
+        ),
+    )
+    export = operations.queue_operation(
+        journal,
+        operations.OperationRequest(operation="export-metadata", args={}, dry_run=False, target_pid=222),
+    )
+
+    assert change["success"] is False
+    assert "Revit process 333 runs an add-in build that ignores command targets" in change["error"]
+    assert change["sessions_ignoring_target"] == [333]
+    assert export["queued"] is True
+    assert export["sessions_ignoring_target"] == [333]
+    assert "333" in export["target_warning"]
+    lines = (tmp_path / "bridge" / "command_queue.jsonl").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line)["operation"] for line in lines] == ["export-metadata"]
+
+
+def _queue_bridge_lines(sandbox: Path, *lines: dict) -> None:
+    queue = sandbox / "bridge" / "command_queue.jsonl"
+    queue.parent.mkdir(parents=True, exist_ok=True)
+    with queue.open("a", encoding="utf-8") as handle:
+        for line in lines:
+            handle.write(json.dumps(line) + "\n")
+
+
+def _write_bridge_results(sandbox: Path, *results: dict) -> None:
+    path = sandbox / "bridge" / "command_results.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(result) + "\n" for result in results), encoding="utf-8")
+
+
+def test_wait_bridge_result_accepts_only_the_target_processes_answer(tmp_path):
+    target = {"process_id": 222, "process_start_utc": _SESSION_STARTED}
+    _queue_bridge_lines(
+        tmp_path,
+        {"id": "cmd-targeted", "operation": "active-document", "target": target},
+        {"id": "cmd-untargeted", "operation": "active-document"},
+        {"id": "cmd-older-build", "operation": "active-document", "target": target},
+    )
+    _write_bridge_results(
+        tmp_path,
+        {"id": "cmd-targeted", "success": True, "message": "from target", "process_id": 222},
+        # A session on a build that ignores targets answered later.
+        {"id": "cmd-targeted", "success": False, "error": "No active Revit document.", "process_id": 333},
+        {"id": "cmd-untargeted", "success": True, "message": "first", "process_id": 222},
+        {"id": "cmd-untargeted", "success": True, "message": "last", "process_id": 333},
+        # Builds before command targets report their process only in the addin block.
+        {"id": "cmd-older-build", "success": True, "message": "addin block", "addin": {"process_id": 222}},
+    )
+    bridge = RevitBridgeClient(tmp_path)
+
+    targeted = bridge.wait_for_command_result("cmd-targeted", timeout=0)
+    untargeted = bridge.wait_for_command_result("cmd-untargeted", timeout=0)
+    one_answer = RevitBridgeClient(tmp_path, target_pid=222).wait_for_command_result("cmd-untargeted", timeout=0)
+    older_build = bridge.wait_for_command_result("cmd-older-build", timeout=0)
+    conflict = RevitBridgeClient(tmp_path, target_pid=333).wait_for_command_result("cmd-targeted", timeout=0)
+
+    assert targeted["success"] is True
+    assert targeted["result"]["message"] == "from target"
+    assert targeted["target_process_id"] == 222
+    assert [other["process_id"] for other in targeted["other_process_results"]] == [333]
+    assert "ignores command targets" in targeted["warning"]
+    assert untargeted["result"]["message"] == "last"
+    assert untargeted["reporting_process_ids"] == [222, 333]
+    # Every session runs an untargeted line, so another session's answer to it is expected.
+    assert one_answer["result"]["message"] == "first"
+    assert [other["process_id"] for other in one_answer["other_process_results"]] == [333]
+    assert "warning" not in one_answer
+    assert older_build["result"]["message"] == "addin block"
+    assert conflict["found"] is False
+    assert "targets Revit process 222, not process 333" in conflict["error"]
+
+
+def test_cli_wait_bridge_result_matches_queued_target_and_pid(tmp_path, capsys):
+    target = {"process_id": 222, "process_start_utc": _SESSION_STARTED}
+    _queue_bridge_lines(tmp_path, {"id": "cmd-1", "operation": "active-document", "target": target})
+    _write_bridge_results(
+        tmp_path,
+        {"id": "cmd-1", "success": True, "message": "from target", "process_id": 222},
+        {"id": "cmd-1", "success": False, "error": "from other session", "process_id": 333},
+    )
+    argv = ["--sandbox", str(tmp_path), "--allow-sandbox-outside-safe-root", "--task-id", "wait-target-test"]
+
+    assert cli.main([*argv, "wait-bridge-result", "--command-id", "cmd-1", "--timeout", "0"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["result"]["message"] == "from target"
+    assert output["target_process_id"] == 222
+
+    assert cli.main([*argv, "wait-bridge-result", "--command-id", "cmd-1", "--pid", "222", "--timeout", "0"]) == 0
+    assert json.loads(capsys.readouterr().out)["result"]["message"] == "from target"
+
+
+def test_revit_addin_command_targets_follow_the_operator_contract():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "tools"
+        / "revit_operator"
+        / "addin"
+        / "HermesRevitOperatorApp.cs"
+    ).read_text(encoding="utf-8")
+    required = re.search(r"TargetRequiredOperations = new\(StringComparer\.Ordinal\)\s*\{(.*?)\}", source, re.DOTALL)
+    tolerance = re.search(r"ProcessStartToleranceSeconds = ([0-9.]+);", source)
+
+    # The add-in refuses untargeted lines for exactly the operations request-operation will not queue untargeted.
+    assert set(re.findall(r'"([^"]+)"', required.group(1))) == operations.TARGET_REQUIRED_OPERATIONS
+    assert float(tolerance.group(1)) == bridge_module.PROCESS_START_TOLERANCE_SECONDS
+    assert '["supports_command_targets"] = true' in source
+    assert 'payload["process_id"] = ProcessId;' in source
+    # The loaded-build contract that verify_loaded_build checks is unchanged.
+    assert f'OperatorProtocolVersion = "{bridge_module.EXPECTED_BRIDGE_PROTOCOL_VERSION}"' in source
+    assert f'SourceCapabilityStamp = "{bridge_module.EXPECTED_SOURCE_CAPABILITY_STAMP}"' in source
 
 
 def test_bridge_readiness_requires_restart_when_installed_but_loaded_stale(tmp_path):

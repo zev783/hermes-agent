@@ -25,7 +25,11 @@ def run_readonly_qa_workflow(
     focus_approval_token: str | None = None,
     idle_nudge: bool = False,
 ) -> dict:
-    """Run a cautious read-only QA sequence against the active Revit document."""
+    """Run a cautious read-only QA sequence against the active Revit document.
+
+    With a targeted bridge, only the target Revit runs the queued commands, the waits accept only its results, and
+    the metadata copy and report read its own snapshot. A target window is also the one captured.
+    """
 
     started_at = utc_now()
     steps: list[dict] = []
@@ -97,14 +101,14 @@ def run_readonly_qa_workflow(
 
     if capture_ui_tree:
         ui_tree_path = journal.run_dir / "ui_tree.json"
-        ui_tree = observer.ui_tree(max_depth=2)
+        ui_tree = observer.ui_tree(hwnd=bridge.target_hwnd, max_depth=2)
         ui_tree_path.write_text(json.dumps(ui_tree, indent=2, sort_keys=True), encoding="utf-8")
         ui_tree["path"] = str(ui_tree_path)
         steps.append({"step": "capture-ui-tree", **ui_tree})
         output_files.append(str(ui_tree_path))
 
     if capture_screenshot:
-        screenshot = observer.screenshot(journal.default_screenshot_path("bmp"))
+        screenshot = observer.screenshot(journal.default_screenshot_path("bmp"), hwnd=bridge.target_hwnd)
         steps.append({"step": "capture-screenshot", **screenshot})
         if screenshot.get("path"):
             output_files.append(str(screenshot["path"]))
@@ -147,7 +151,14 @@ def _queue_and_wait(
 ) -> dict:
     queued = queue_operation(
         journal,
-        OperationRequest(operation=operation, args={}, dry_run=False),
+        # Untargeted, every Revit on the bridge runs the command and the wait takes whichever result lands first.
+        OperationRequest(
+            operation=operation,
+            args={},
+            dry_run=False,
+            target_hwnd=bridge.target_hwnd,
+            target_pid=bridge.target_pid,
+        ),
     )
     command_id = queued.get("command", {}).get("id")
     step = {

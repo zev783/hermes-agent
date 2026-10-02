@@ -15,7 +15,7 @@ from .bridge import RevitBridgeClient
 from .constants import SAFE_PROJECT_ROOT
 from .journal import TaskJournal, make_task_id, utc_now
 from .revit_locator import infer_revit_version_from_model, resolve_revit_exe
-from .safety import READ_ONLY_BRIDGE_OPERATIONS, authorize, classify_action, validate_output_path
+from .safety import READ_ONLY_BRIDGE_OPERATIONS, SafetyDecision, authorize, classify_action, validate_output_path
 from .version_support import validate_revit_version
 
 
@@ -50,6 +50,52 @@ class OperationRequest:
     target_pid: int | None = None
     # The queued line's id, for wait-bridge-result. Not args["id"]: activate-view reads that as a view id.
     command_id: str | None = None
+
+
+def request_operation_payload(request: OperationRequest) -> dict:
+    """The request-operation payload that queue_operation classifies and journals, without the target."""
+    return {
+        "operation": request.operation.strip().lower(),
+        "args": request.args,
+        "allow_model_write": request.allow_model_write,
+        "allow_sync": request.allow_sync,
+    }
+
+
+def classify_operation(payload: dict, target: dict | None = None) -> SafetyDecision:
+    """Classify a request-operation payload for the Revit process it is queued for.
+
+    The approval covers the target as well, so a token approved for one Revit process does not run in another, or in a
+    later process that reuses its id. Approval plans classify through here so that their tokens are the ones
+    queue_operation expects.
+    """
+    return classify_action("request-operation", {**payload, "target": target} if target else payload)
+
+
+def resolve_command_target(sandbox: Path, target_hwnd: int | None, target_pid: int | None) -> dict | None:
+    """Resolve --hwnd/--pid to the target a queued line names, as queue_operation will, or None without either."""
+    if not (target_hwnd or target_pid):
+        return None
+    return RevitBridgeClient(sandbox, target_hwnd=target_hwnd, target_pid=target_pid).command_target()
+
+
+def target_cli_args(target: dict | None) -> list[str]:
+    """The request-operation arguments that name a resolved target again."""
+    return ["--pid", str(target["process_id"])] if target else []
+
+
+def require_target(operation: str, bridge: RevitBridgeClient) -> dict:
+    """Refuse an untargeted operation that must name its Revit process, listing the live ones to choose from."""
+    if operation not in TARGET_REQUIRED_OPERATIONS:
+        return {}
+    live = [session for session in bridge.bridge_sessions() if session["live"]]
+    return {
+        "error": (
+            f"Operation {operation!r} changes a model or the open documents, so it must name the Revit process "
+            "it is for: pass --hwnd or --pid. " + _live_sessions_text(live)
+        ),
+        "live_sessions": live,
+    }
 
 
 def validate_model_path(path: Path, allow_outside_safe_root: bool = False) -> str | None:
@@ -154,18 +200,12 @@ def open_model(
 
 
 def queue_operation(journal: TaskJournal, request: OperationRequest) -> dict:
-    operation = request.operation.strip().lower()
-    payload = {
-        "operation": operation,
-        "args": request.args,
-        "allow_model_write": request.allow_model_write,
-        "allow_sync": request.allow_sync,
-    }
+    payload = request_operation_payload(request)
+    operation = payload["operation"]
     bridge = RevitBridgeClient(journal.sandbox, target_hwnd=request.target_hwnd, target_pid=request.target_pid)
     resolution = bridge.command_target() if request.target_hwnd or request.target_pid else None
     target = resolution.get("target") if resolution else None
-    # The approval covers the target as well, so a token approved for one Revit process does not run in another.
-    decision = classify_action("request-operation", {**payload, "target": target} if target else payload)
+    decision = classify_operation(payload, target)
     allowed, reason = authorize(decision, request.approval_token)
     guard_error = _guard_operation(operation, request)
     target_check = {} if guard_error else _check_target(operation, bridge, resolution)
@@ -310,16 +350,7 @@ def _guard_operation(operation: str, request: OperationRequest) -> str | None:
 def _check_target(operation: str, bridge: RevitBridgeClient, resolution: dict | None) -> dict:
     """Check that the queued line runs in its target Revit only. Returns an error and/or fields for the result."""
     if resolution is None:
-        if operation not in TARGET_REQUIRED_OPERATIONS:
-            return {}
-        live = [session for session in bridge.bridge_sessions() if session["live"]]
-        return {
-            "error": (
-                f"Operation {operation!r} changes a model or the open documents, so it must name the Revit process "
-                "it is for: pass --hwnd or --pid. " + _live_sessions_text(live)
-            ),
-            "live_sessions": live,
-        }
+        return require_target(operation, bridge)
     if not resolution["success"]:
         return {"error": resolution["error"]}
     target_pid = resolution["target"]["process_id"]

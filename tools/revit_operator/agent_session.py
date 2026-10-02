@@ -11,7 +11,16 @@ from .actions import ActionRequest, SafeActionExecutor
 from .bridge import RevitBridgeClient
 from .constants import DRAFT_LABEL, SAFE_PROJECT_ROOT
 from .journal import TaskJournal, utc_now
-from .operations import OperationRequest, open_model, queue_operation
+from .operations import (
+    OperationRequest,
+    classify_operation,
+    open_model,
+    queue_operation,
+    request_operation_payload,
+    require_target,
+    resolve_command_target,
+    target_cli_args,
+)
 from .readiness import wait_model_ready
 from .safety import APPROVAL_REQUIRED, BLOCK, classify_action, validate_output_path
 from .session_checkpoint import build_agent_session_resume_plan, write_agent_session_checkpoint
@@ -362,9 +371,16 @@ def run_agent_session(
                     "dry_run": True,
                 }
             steps.append({"step": "open-model-dry-run", **_without_approval_tokens(open_dry_run)})
+        # A bridge that names a Revit process asks only that process for its active document.
         active_document_refresh = queue_operation(
             journal,
-            OperationRequest(operation="active-document", args={}, dry_run=False),
+            OperationRequest(
+                operation="active-document",
+                args={},
+                dry_run=False,
+                target_hwnd=bridge.target_hwnd,
+                target_pid=bridge.target_pid,
+            ),
         )
         active_document_step = {
             "step": "bridge-active-document-refresh",
@@ -1079,9 +1095,20 @@ def build_agent_session_approval_plan(
     expected_title_contains: str = "",
     max_hours: float = 4.0,
     parameters: dict | None = None,
+    target_hwnd: int | None = None,
+    target_pid: int | None = None,
 ) -> dict:
-    """Create a fresh approval packet for the gated phases of an agent session."""
+    """Create a fresh approval packet for the gated phases of an agent session.
 
+    With --hwnd/--pid, the approvals of bridge operations cover that Revit process, and an item executes there. An
+    untargeted packet blocks the operations that change a model or the open documents: request-operation refuses
+    to queue them untargeted.
+    """
+
+    resolution = resolve_command_target(journal.sandbox, target_hwnd, target_pid)
+    if resolution and not resolution["success"]:
+        return {"success": False, "error": resolution["error"], "requested_target": resolution["requested"]}
+    target = resolution["target"] if resolution else None
     parameters = {str(key): str(value) for key, value in (parameters or {}).items()}
     plan = plan_agent_session(
         journal,
@@ -1096,10 +1123,11 @@ def build_agent_session_approval_plan(
     private_items: list[dict] = []
     blocked_items: list[dict] = []
 
-    for item in _ui_workflow_approval_items(plan.get("objective") or "", parameters):
+    for item in _ui_workflow_approval_items(plan.get("objective") or "", parameters, target):
         public_items.append(_without_approval_tokens(item["public"]))
         private_items.append(item["private"])
-    for item in _model_change_approval_items(plan.get("objective") or "", parameters):
+    bridge = RevitBridgeClient(journal.sandbox)
+    for item in _model_change_approval_items(plan.get("objective") or "", parameters, target, bridge):
         if item.get("blocked"):
             blocked_items.append(_without_approval_tokens(item["public"]))
         else:
@@ -1111,6 +1139,7 @@ def build_agent_session_approval_plan(
         "created_at": utc_now(),
         "schema": "hermes-revit-agent-session-approval-material/v1",
         "objective": plan.get("objective"),
+        "target": target,
         "approval_items": private_items,
         "warning": (
             "Private approval material. Use only after a fresh agent-session-run preflight "
@@ -1126,6 +1155,8 @@ def build_agent_session_approval_plan(
         "created_at": utc_now(),
         "objective": plan.get("objective"),
         "plan_path": plan.get("path"),
+        "target": target,
+        "target_session": resolution["session"] if resolution else None,
         "approval_required_count": len(public_items),
         "blocked_count": len(blocked_items),
         "approval_material_withheld_from_public": True,
@@ -1154,6 +1185,7 @@ def build_agent_session_approval_plan(
         {
             "command": "agent-session-approval-plan",
             "requested_action": {"objective": plan.get("objective")},
+            "target": target,
             "risk_classification": classify_action("agent-session-approval-plan", {}).to_dict(),
             "approval_status": {"allowed": True, "reason": "Approval planning only; no Revit action executed."},
             "result": {
@@ -1181,7 +1213,11 @@ def execute_agent_session_approved_item(
     allow_approved_ui: bool = False,
     ui_command_runner=None,
 ) -> dict:
-    """Dry-run or execute one explicitly approved session item."""
+    """Dry-run or execute one explicitly approved session item.
+
+    An item approved for a Revit process runs there unless the bridge names another one. Its token covers the process
+    as it was planned, so another process, or the same id after a restart, is refused.
+    """
 
     started_at = utc_now()
     path_error = validate_output_path(approval_material_path, journal.sandbox)
@@ -1193,6 +1229,9 @@ def execute_agent_session_approved_item(
     item = _find_private_approval_item(material, item_id)
     if item is None:
         return {"success": False, "error": f"Approval item not found: {item_id}"}
+    approved_target = _approved_target(item)
+    if approved_target and not (bridge.target_hwnd or bridge.target_pid):
+        bridge = RevitBridgeClient(journal.sandbox, target_pid=approved_target.get("process_id"))
 
     preflight = run_agent_session(
         journal,
@@ -1245,12 +1284,14 @@ def execute_agent_session_approved_item(
                 execute=execute,
             )
         )
-        status = "executed" if execution.get("executed") else "ready_for_approval_execution"
-        reason = (
-            "Approved model-change item executed."
-            if execution.get("executed")
-            else "Approved model-change item dry-run completed; no Revit change was queued."
-        )
+        if execution.get("executed"):
+            status, reason = "executed", "Approved model-change item executed."
+        elif execute:
+            status = "stopped_refused"
+            reason = execution.get("target_mismatch") or execution["dry_run_result"].get("error")
+        else:
+            status = "ready_for_approval_execution"
+            reason = "Approved model-change item dry-run completed; no Revit change was queued."
         execution["model_write_performed"] = bool(execution.get("executed"))
     elif item_kind == "ui-workflow-step":
         execution.update(
@@ -1260,18 +1301,26 @@ def execute_agent_session_approved_item(
                 item,
                 execute=execute,
                 ui_command_runner=ui_command_runner,
+                target_hwnd=bridge.target_hwnd,
+                target_pid=bridge.target_pid,
             )
         )
-        status = "executed" if execution.get("executed") else "ready_for_approval_execution"
-        reason = (
-            (
+        if execution.get("executed"):
+            status = "executed"
+            reason = (
                 "Approved UI workflow item executed under UI-only operator consent."
                 if ui_operator_consent_ok and not confirmation_ok
                 else "Approved UI workflow item executed."
             )
-            if execution.get("executed")
-            else "Approved UI workflow item dry-run completed; no UI action was executed."
-        )
+        elif execute:
+            status = "stopped_refused"
+            workflow_result = execution["workflow_result"]
+            reason = (
+                execution.get("target_mismatch") or workflow_result.get("stop_reason") or workflow_result.get("error")
+            )
+        else:
+            status = "ready_for_approval_execution"
+            reason = "Approved UI workflow item dry-run completed; no UI action was executed."
     else:
         status = "unsupported_item"
         reason = f"Unsupported approval item kind: {item.get('kind')}"
@@ -2307,7 +2356,7 @@ def _model_change_requests(objective: str, parameters: dict) -> list[dict]:
     return requests
 
 
-def _ui_workflow_approval_items(objective: str, parameters: dict) -> list[dict]:
+def _ui_workflow_approval_items(objective: str, parameters: dict, target: dict | None = None) -> list[dict]:
     text = objective.casefold()
     items: list[dict] = []
     for name, hints in WORKFLOW_HINTS.items():
@@ -2315,12 +2364,14 @@ def _ui_workflow_approval_items(objective: str, parameters: dict) -> list[dict]:
             continue
         recipe = UI_WORKFLOWS[name]
         for index, step_recipe in enumerate(recipe.steps):
-            step = step_recipe.render(parameters)
+            step = step_recipe.render(parameters, target)
             policy = step.get("policy") if isinstance(step.get("policy"), dict) else {}
             token = str(policy.get("approval_token") or "")
             if policy.get("decision") != APPROVAL_REQUIRED or not token:
                 continue
             item_id = f"ui:{recipe.name}:step:{index}"
+            # Only a request-operation step's token covers the target, which the step is then queued for.
+            revit_target = target if step.get("command") == "request-operation" else None
             execute_command = _command(
                 [
                     "run-ui-workflow",
@@ -2331,6 +2382,7 @@ def _ui_workflow_approval_items(objective: str, parameters: dict) -> list[dict]:
                     json.dumps({str(index): token}, sort_keys=True, separators=(",", ":")),
                     "--parameters-json",
                     json.dumps(parameters, sort_keys=True),
+                    *target_cli_args(revit_target),
                 ]
             )
             public = {
@@ -2340,6 +2392,7 @@ def _ui_workflow_approval_items(objective: str, parameters: dict) -> list[dict]:
                 "step_index": index,
                 "command": step.get("command"),
                 "args": step.get("args", []),
+                "revit_target": revit_target,
                 "risk": policy.get("risk"),
                 "reason": policy.get("reason"),
                 "approval_token_withheld": True,
@@ -2360,7 +2413,12 @@ def _ui_workflow_approval_items(objective: str, parameters: dict) -> list[dict]:
     return items
 
 
-def _model_change_approval_items(objective: str, parameters: dict) -> list[dict]:
+def _model_change_approval_items(
+    objective: str,
+    parameters: dict,
+    target: dict | None,
+    bridge: RevitBridgeClient,
+) -> list[dict]:
     text = objective.casefold()
     items: list[dict] = []
     for operation, pattern in MODEL_CHANGE_OPERATIONS.items():
@@ -2370,45 +2428,51 @@ def _model_change_approval_items(objective: str, parameters: dict) -> list[dict]
         blocked = operation in {"save", "sync", "delete"}
         allow_model_write = not blocked
         allow_sync = operation == "sync"
-        decision = classify_action(
-            "request-operation",
-            {
-                "operation": operation,
-                "args": payload,
-                "allow_model_write": allow_model_write,
-                "allow_sync": allow_sync,
-            },
+        request = OperationRequest(
+            operation=operation,
+            args=payload,
+            allow_model_write=allow_model_write,
+            allow_sync=allow_sync,
         )
+        # The token queue_operation will expect when the item queues this request for the target.
+        decision = classify_operation(request_operation_payload(request), target)
         policy = decision.to_dict()
+        # request-operation refuses to queue a change to a model or the open documents untargeted.
+        missing_target = {} if blocked or target else require_target(operation, bridge)
+        executable = not blocked and not missing_target
         item_id = f"model-change:{operation}"
         public = {
             "id": item_id,
             "kind": "model-change-operation",
             "operation": operation,
             "payload": payload,
+            "revit_target": target,
             "risk": policy.get("risk"),
             "reason": (
                 "Blocked by session approval policy."
                 if blocked
-                else policy.get("reason")
+                else missing_target.get("error") or policy.get("reason")
             ),
-            "blocked": blocked,
-            "approval_token_withheld": bool(policy.get("approval_token")) and not blocked,
-            "execute_command_withheld": not blocked,
+            "blocked": not executable,
+            "approval_token_withheld": bool(policy.get("approval_token")) and executable,
+            "execute_command_withheld": executable,
             "verify_before_execution": [
                 "agent-session-run",
                 "request-operation dry-run",
                 "post-action active-document refresh",
             ],
         }
-        if blocked:
+        if missing_target:
+            public["target_required"] = True
+            public["live_sessions"] = missing_target["live_sessions"]
+        if not executable:
             items.append({"blocked": True, "public": public})
             continue
         token = str(policy.get("approval_token") or "")
         execute_parts = ["request-operation", "--operation", operation, "--execute"]
         if payload:
             execute_parts.extend(["--args-json", json.dumps(payload, sort_keys=True)])
-        execute_parts.extend(["--allow-model-write", "--approval-token", token])
+        execute_parts.extend(["--allow-model-write", "--approval-token", token, *target_cli_args(target)])
         private = {
             **public,
             "approval_token": token,
@@ -2435,6 +2499,9 @@ def _execute_model_change_item(
     operation = str(item.get("operation") or "")
     payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
     token = str(item.get("approval_token") or "")
+    # The bridge names the Revit process this run is for: queue_operation resolves it again, and the token covers it
+    # only if it is still the process the item was approved for.
+    target = {"target_hwnd": bridge.target_hwnd, "target_pid": bridge.target_pid}
     pre_action_document = _safe_bridge_active_document(bridge)
     request = OperationRequest(
         operation=operation,
@@ -2443,6 +2510,7 @@ def _execute_model_change_item(
         approval_token=token,
         allow_model_write=True,
         allow_sync=operation in {"sync", "synchronize-with-central"},
+        **target,
     )
     result = queue_operation(journal, request)
     command_id = result.get("command", {}).get("id")
@@ -2455,13 +2523,14 @@ def _execute_model_change_item(
     if execute and result.get("success"):
         post_action_refresh = queue_operation(
             journal,
-            OperationRequest(operation="active-document", args={}, dry_run=False),
+            OperationRequest(operation="active-document", args={}, dry_run=False, **target),
         )
         refresh_id = post_action_refresh.get("command", {}).get("id")
         if post_action_refresh.get("success") and refresh_id:
             post_action_wait = bridge.wait_for_command_result(refresh_id, timeout=15, poll=1)
         post_action_document = _safe_bridge_active_document(bridge)
-    return {
+    approved_target = _approved_target(item)
+    execution = {
         "kind": "model-change-operation",
         "operation": operation,
         "pre_action_active_document": _without_approval_tokens(pre_action_document),
@@ -2476,11 +2545,39 @@ def _execute_model_change_item(
             "model_write_guard": request.allow_model_write,
             "sync_guard": request.allow_sync,
             "approval_bound_to_private_item": bool(token),
+            "approved_target": approved_target,
+            "queued_target": result.get("target"),
             "post_action_refresh_requested": bool(post_action_refresh),
             "post_action_refresh_success": bool(post_action_refresh and post_action_refresh.get("success")),
         },
         "executed": bool(execute and result.get("success")),
     }
+    mismatch = _target_mismatch(approved_target, result.get("target"))
+    if mismatch:
+        execution["target_mismatch"] = mismatch
+    return execution
+
+
+def _approved_target(item: dict) -> dict | None:
+    """The Revit process an approval item's token covers, or None for an untargeted item."""
+    target = item.get("revit_target")
+    return target if isinstance(target, dict) else None
+
+
+def _target_mismatch(approved: dict | None, queued: dict | None) -> str | None:
+    """Explain why an item's token does not cover the Revit process this run resolved."""
+    if queued is None or queued == approved:
+        return None
+    process = f"Revit process {queued.get('process_id')} (started {queued.get('process_start_utc')})"
+    approval = (
+        "without a target"
+        if approved is None
+        else f"for Revit process {approved.get('process_id')} (started {approved.get('process_start_utc')})"
+    )
+    return (
+        f"This item was approved {approval}, so its token does not cover {process}. Re-run "
+        "agent-session-approval-plan with --hwnd or --pid for the Revit process it should run in."
+    )
 
 
 def _safe_bridge_active_document(bridge: RevitBridgeClient) -> dict:
@@ -2498,6 +2595,8 @@ def _execute_ui_workflow_item(
     *,
     execute: bool,
     ui_command_runner,
+    target_hwnd: int | None = None,
+    target_pid: int | None = None,
 ) -> dict:
     workflow = str(item.get("workflow") or "")
     step_index = int(item.get("step_index") or 0)
@@ -2512,14 +2611,22 @@ def _execute_ui_workflow_item(
         max_steps=step_index + 1,
         observe_func=observer.status,
         command_runner=ui_command_runner,
+        target_hwnd=target_hwnd,
+        target_pid=target_pid,
     )
-    return {
+    execution = {
         "kind": "ui-workflow-step",
         "workflow": workflow,
         "step_index": step_index,
         "workflow_result": _without_approval_tokens(result),
         "executed": bool(execute and result.get("success")),
     }
+    # Only a request-operation step's token covers a target.
+    if item.get("command") == "request-operation":
+        mismatch = _target_mismatch(_approved_target(item), result.get("target"))
+        if mismatch:
+            execution["target_mismatch"] = mismatch
+    return execution
 
 
 def _operation_payload(operation: str, parameters: dict) -> dict:

@@ -7,6 +7,13 @@ import re
 from dataclasses import dataclass, field
 
 from .journal import TaskJournal, utc_now
+from .operations import (
+    OperationRequest,
+    classify_operation,
+    request_operation_payload,
+    resolve_command_target,
+    target_cli_args,
+)
 from .safety import APPROVAL_REQUIRED, BLOCK, classify_action, validate_output_path
 
 MODAL_SAFE_COMMANDS = {
@@ -36,6 +43,17 @@ WORKFLOW_SMOKE_SAFE_COMMANDS = {
     "recovery-snapshot",
 }
 
+# Recipe commands that read one Revit's bridge status, or queue for it, given --hwnd/--pid. A targeted run passes them
+# the target.
+BRIDGE_TARGET_COMMANDS = {
+    "bridge-readiness",
+    "qa-workflow",
+    "request-operation",
+    "status",
+    "verify-bridge-build",
+    "wait-model-ready",
+}
+
 WORKFLOW_SMOKE_DIAGNOSTIC_FALSE_OK = {
     "bridge-readiness",
     "verify-bridge-build",
@@ -55,11 +73,18 @@ class WorkflowStepRecipe:
     human_only: bool = False
     note: str = ""
 
-    def render(self, parameters: dict) -> dict:
+    def render(self, parameters: dict, target: dict | None = None) -> dict:
+        """Render the step. A bridge step reads or queues for the target Revit process, if one is given."""
         rendered_args = [_render_template(arg, parameters) for arg in self.args]
         missing = sorted(_missing_placeholders([self.command, *self.args], parameters))
+        if self.command == "request-operation":
+            # The step's token must be the one request-operation checks, which covers the target the step names.
+            decision = classify_operation(_request_operation_payload(rendered_args), target)
+        else:
+            decision = classify_action(self.command, _payload_from_args(rendered_args))
+        if self.command in BRIDGE_TARGET_COMMANDS:
+            rendered_args.extend(target_cli_args(target))
         payload = {"command": self.command, "args": rendered_args}
-        decision = classify_action(self.command, _payload_from_args(rendered_args))
         return {
             "command": self.command,
             "args": rendered_args,
@@ -633,13 +658,15 @@ def plan_ui_workflow(
     *,
     name: str,
     parameters: dict | None = None,
+    target: dict | None = None,
 ) -> dict:
+    """Plan a recipe. With a resolved target, its bridge steps read and queue for that Revit process only."""
     recipe = UI_WORKFLOWS.get(name.strip().lower())
     if not recipe:
         return {"success": False, "error": f"Unknown UI workflow: {name}"}
 
     parameters = {str(key): str(value) for key, value in (parameters or {}).items()}
-    planned_steps = [step.render(parameters) for step in recipe.steps]
+    planned_steps = [step.render(parameters, target) for step in recipe.steps]
     missing = sorted(
         {
             missing
@@ -660,6 +687,7 @@ def plan_ui_workflow(
         "preconditions": list(recipe.preconditions),
         "blocked_actions": list(recipe.blocked_actions),
         "approval_gates": list(recipe.approval_gates),
+        "target": target,
         "steps": planned_steps,
         "step_count": len(planned_steps),
         "path": str(journal.run_dir / "ui_workflow_plan.json"),
@@ -675,6 +703,7 @@ def plan_ui_workflow(
         {
             "command": "plan-ui-workflow",
             "requested_action": {"name": name, "parameters": parameters},
+            "target": target,
             "risk_classification": classify_action("plan-ui-workflow", {}).to_dict(),
             "approval_status": {"allowed": True, "reason": "Planning only."},
             "result": {
@@ -699,10 +728,21 @@ def run_ui_workflow(
     stop_on_error: bool = True,
     observe_func=None,
     command_runner=None,
+    target_hwnd: int | None = None,
+    target_pid: int | None = None,
 ) -> dict:
-    """Run a recipe through fresh observation and step-level safety gates."""
+    """Run a recipe through fresh observation and step-level safety gates.
 
-    plan = plan_ui_workflow(journal, name=name, parameters=parameters)
+    With --hwnd/--pid, the bridge steps read that Revit process's status and queue for it. Request-operation tokens
+    cover the process as it resolves now, so a token approved for another process, or for this id before a restart,
+    stops the step.
+    """
+
+    resolution = resolve_command_target(journal.sandbox, target_hwnd, target_pid)
+    if resolution and not resolution["success"]:
+        return {"success": False, "error": resolution["error"], "requested_target": resolution["requested"]}
+    target = resolution["target"] if resolution else None
+    plan = plan_ui_workflow(journal, name=name, parameters=parameters, target=target)
     output = journal.run_dir / "ui_workflow_run.json"
     error = validate_output_path(output, journal.sandbox)
     if error:
@@ -824,6 +864,7 @@ def run_ui_workflow(
         {
             "command": "run-ui-workflow",
             "requested_action": {"name": name, "parameters": parameters or {}, "dry_run": dry_run},
+            "target": target,
             "observed_ui_state_before_action": before_state,
             "observed_ui_state_after_action": after_state,
             "risk_classification": classify_action("run-ui-workflow", {}).to_dict(),
@@ -875,6 +916,32 @@ def _payload_from_args(args: list[str]) -> dict:
             payload[key] = True
             index += 1
     return payload
+
+
+# The request-operation flags a recipe step may pass. The step runs through the CLI, which builds the payload its
+# approval covers from these; --hwnd/--pid name the target, which the step appends.
+RECIPE_OPERATION_FLAGS = {"operation", "args_json", "allow_model_write", "allow_sync"}
+
+
+def _request_operation_payload(args: list[str]) -> dict:
+    """The payload request-operation classifies for a recipe step's rendered arguments."""
+    flags = _payload_from_args(args)
+    unsupported = ", ".join("--" + key.replace("_", "-") for key in sorted(set(flags) - RECIPE_OPERATION_FLAGS))
+    if unsupported:
+        raise ValueError(f"A recipe request-operation step cannot pass {unsupported}; use --args-json.")
+    try:
+        op_args = json.loads(str(flags.get("args_json") or "{}"))
+    except json.JSONDecodeError:
+        # request-operation refuses arguments that are not JSON, so keep them in a form no approval can match.
+        op_args = flags.get("args_json")
+    return request_operation_payload(
+        OperationRequest(
+            operation=str(flags.get("operation") or ""),
+            args=op_args,
+            allow_model_write=flags.get("allow_model_write") is True,
+            allow_sync=flags.get("allow_sync") is True,
+        )
+    )
 
 
 def _observe(observe_func) -> dict:

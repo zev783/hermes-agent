@@ -32,6 +32,16 @@ Every Revit that loads the add-in shares one bridge folder, so:
   `set-project-info-parameter`. The add-in refuses those untargeted
   (`target_required`), and `request-operation` will not queue them without
   `--hwnd` or `--pid`.
+- Approval plans name the target too. `agent-session-approval-plan`,
+  `workflow-approval-plan` and `plan-ui-workflow` take `--hwnd` (or `--pid`),
+  and their request-operation tokens cover that process. Untargeted, the
+  agent-session and workflow plans list the operations above as blocked
+  instead of issuing tokens that `request-operation` would refuse. Execute
+  with the same target: `replay-workflow` and `run-ui-workflow` take `--hwnd`
+  or `--pid` (`run-ui-workflow` passes it to every recipe step that takes
+  one), and `agent-session-execute-approved-item` defaults to the process the
+  item was approved for. A token planned for another process, or for the same
+  id before a restart, is refused.
 - Every command result carries the `process_id` and `process_start_utc` of
   the process that wrote it. For a targeted command, `wait-bridge-result`
   accepts only the target's result and flags answers from other processes.

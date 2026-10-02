@@ -7,9 +7,19 @@ import json
 import re
 from pathlib import Path, PureWindowsPath
 
+from .bridge import RevitBridgeClient
 from .constants import DRAFT_LABEL
 from .journal import TaskJournal, utc_now
-from .safety import BLOCK, authorize, classify_action, validate_output_path
+from .operations import (
+    TARGET_REQUIRED_OPERATIONS,
+    OperationRequest,
+    classify_operation,
+    queue_operation,
+    require_target,
+    resolve_command_target,
+    target_cli_args,
+)
+from .safety import BLOCK, SafetyDecision, authorize, classify_action, validate_output_path
 
 EXECUTABLE_REPLAY_ACTIONS = {"focus", "press-key", "click", "type-text", "uia-invoke"}
 EXECUTABLE_REPLAY_COMMANDS = EXECUTABLE_REPLAY_ACTIONS | {"request-operation"}
@@ -121,7 +131,9 @@ def plan_workflow_replay(
     name: str | None = None,
     path: Path | None = None,
     parameters: dict | None = None,
+    target: dict | None = None,
 ) -> dict:
+    """Plan a replay. With a resolved target, its request-operation steps are classified for that Revit process."""
     workflow_path = _resolve_workflow_path(sandbox, name=name, path=path)
     path_error = validate_output_path(workflow_path, sandbox)
     if path_error:
@@ -133,10 +145,11 @@ def plan_workflow_replay(
     planned_steps = []
     approval_required = []
     blocked = []
+    target_required = []
     for index, step in enumerate(workflow.get("steps") or []):
         command = str(step.get("command") or "")
         payload = _payload_for_step(step, parameters or {})
-        decision = classify_action(command, payload)
+        decision = _classify_step(command, payload, target)
         planned = {
             "index": index,
             "command": command,
@@ -146,6 +159,9 @@ def plan_workflow_replay(
             "will_execute": False,
             "reason": "Replay planning is dry-run only; execute requires fresh observation and approval.",
         }
+        if _target_required(command, payload, target):
+            planned["target_required"] = True
+            target_required.append(index)
         planned_steps.append(planned)
         if decision.decision == "approval_required":
             approval_required.append(index)
@@ -159,8 +175,10 @@ def plan_workflow_replay(
         "step_count": len(planned_steps),
         "parameters": workflow.get("parameters") or [],
         "parameter_overrides": parameters or {},
+        "target": target,
         "approval_required_steps": approval_required,
         "blocked_steps": blocked,
+        "target_required_steps": target_required,
         "can_replay_without_human": not approval_required and not blocked,
         "planned_steps": planned_steps,
         "replay_policy": workflow.get("replay_policy", {}),
@@ -174,8 +192,15 @@ def plan_workflow_approvals(
     name: str | None = None,
     path: Path | None = None,
     parameters: dict | None = None,
+    target_hwnd: int | None = None,
+    target_pid: int | None = None,
 ) -> dict:
-    """Create a fresh approval package for a recorded workflow replay."""
+    """Create a fresh approval package for a recorded workflow replay.
+
+    Journals record the Revit process a request-operation ran in outside its requested action, so a replay never
+    names a process that has since exited. The approval plan names the target instead: --hwnd/--pid resolve to the
+    process whose identity the request-operation tokens cover, and the replay must target the same process.
+    """
 
     workflow_path = _resolve_workflow_path(sandbox, name=name, path=path)
     path_error = validate_output_path(workflow_path, sandbox)
@@ -184,12 +209,17 @@ def plan_workflow_approvals(
     if not workflow_path.exists():
         return {"success": False, "error": f"Workflow template not found: {workflow_path}"}
 
+    resolution = resolve_command_target(sandbox, target_hwnd, target_pid)
+    if resolution and not resolution["success"]:
+        return {"success": False, "error": resolution["error"], "requested_target": resolution["requested"]}
+    target = resolution["target"] if resolution else None
     workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
     replay_plan = plan_workflow_replay(
         sandbox,
         name=name,
         path=path,
         parameters=parameters or {},
+        target=target,
     )
     if not replay_plan.get("success"):
         return replay_plan
@@ -201,7 +231,20 @@ def plan_workflow_approvals(
         policy = step.get("policy") if isinstance(step.get("policy"), dict) else {}
         decision = str(policy.get("decision") or "")
         index = int(step.get("index") or 0)
-        if decision == "approval_required":
+        if step.get("target_required"):
+            # request-operation refuses this step untargeted, so an approval for it could never be used.
+            operation = str(step["payload"].get("operation") or "").strip().lower()
+            blocked_steps.append(
+                {
+                    "index": index,
+                    "command": step.get("command"),
+                    "payload": step.get("payload"),
+                    "risk": policy.get("risk"),
+                    "reason": require_target(operation, RevitBridgeClient(sandbox))["error"],
+                    "target_required": True,
+                }
+            )
+        elif decision == "approval_required":
             token = str(policy.get("approval_token") or "")
             approval_tokens[str(index)] = token
             approval_steps.append(
@@ -236,6 +279,8 @@ def plan_workflow_approvals(
         return {"success": False, "error": output_error}
 
     replay_target_args = _workflow_target_args(name=name or workflow.get("name"), path=workflow_path if path else None)
+    # The tokens cover the target, so the replay must name the same Revit process.
+    replay_target_args.extend(target_cli_args(target))
     parameters_arg = _parameters_arg(parameters or {})
     replay_dry_run_command = " ".join(
         ["revit-operator", "replay-workflow", *replay_target_args, *parameters_arg]
@@ -261,6 +306,8 @@ def plan_workflow_approvals(
         "name": workflow.get("name"),
         "step_count": replay_plan.get("step_count"),
         "parameter_overrides": parameters or {},
+        "target": target,
+        "target_session": resolution["session"] if resolution else None,
         "template_contains_approval_tokens": _contains_approval_token(workflow),
         "stale_approval_tokens_reused": False,
         "approval_required_count": len(approval_steps),
@@ -285,6 +332,7 @@ def plan_workflow_approvals(
                 "workflow": str(workflow_path),
                 "parameters": parameters or {},
             },
+            "target": target,
             "risk_classification": classify_action("workflow-approval-plan", {}).to_dict(),
             "approval_status": {"allowed": True, "reason": "Read-only workflow approval planning."},
             "result": {
@@ -312,12 +360,19 @@ def replay_workflow(
     stop_on_modal: bool = True,
     max_steps: int | None = None,
     recovery_snapshot_on_stop: bool = True,
+    target_hwnd: int | None = None,
+    target_pid: int | None = None,
 ) -> dict:
     """Plan or execute a recorded workflow with fresh gates.
 
     Replay is deliberately narrower than the command surface. It never reuses
     old approvals, observes Revit before every step, and only executes guarded
     action primitives or bridge operation requests.
+
+    With --hwnd/--pid, request-operation steps are queued for that Revit
+    process. Their tokens cover the process as it resolves now, so tokens
+    approved for another process, or for this id before a restart, stop the
+    replay.
     """
 
     workflow_path = _resolve_workflow_path(sandbox, name=name, path=path)
@@ -326,6 +381,10 @@ def replay_workflow(
         return {"success": False, "error": path_error}
     if not workflow_path.exists():
         return {"success": False, "error": f"Workflow template not found: {workflow_path}"}
+    resolution = resolve_command_target(sandbox, target_hwnd, target_pid)
+    if resolution and not resolution["success"]:
+        return {"success": False, "error": resolution["error"], "requested_target": resolution["requested"]}
+    target = resolution["target"] if resolution else None
 
     workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
     raw_steps = workflow.get("steps") or []
@@ -346,7 +405,7 @@ def replay_workflow(
         before = _fresh_status(sandbox, observer)
         before_state = str(before.get("state") or "unknown")
         state_gate = _state_gate(step, before, stop_on_modal=stop_on_modal)
-        decision = classify_action(command, payload)
+        decision = _classify_step(command, payload, target)
         token = tokens.get(index)
         allowed, auth_reason = authorize(decision, token)
         executable = command in EXECUTABLE_REPLAY_COMMANDS
@@ -364,6 +423,8 @@ def replay_workflow(
             "dry_run": dry_run,
             "executed": False,
         }
+        if _target_required(command, payload, target):
+            replay_step["target_required"] = True
 
         if not state_gate["allowed"]:
             replay_step["status"] = "stopped_state_gate"
@@ -395,7 +456,15 @@ def replay_workflow(
             stop_reason = auth_reason
             break
 
-        execution = _execute_replay_step(journal, observer, command, payload, token)
+        execution = _execute_replay_step(
+            journal,
+            observer,
+            command,
+            payload,
+            token,
+            target_hwnd=target_hwnd,
+            target_pid=target_pid,
+        )
         replay_step["execution"] = execution
         replay_step["executed"] = bool(execution.get("success"))
         replay_step["status"] = "executed" if replay_step["executed"] else "failed"
@@ -424,6 +493,7 @@ def replay_workflow(
         "workflow_path": str(workflow_path),
         "name": workflow.get("name"),
         "step_count": len(replay_steps),
+        "target": target,
         "executed_steps": executed_steps,
         "skipped_steps": skipped_steps,
         "approval_required_steps": approval_required_steps,
@@ -453,6 +523,7 @@ def replay_workflow(
                 "max_steps": max_steps,
                 "stop_on_modal": stop_on_modal,
             },
+            "target": target,
             "result": {
                 "status": "dry_run" if dry_run else ("executed" if result["success"] else "stopped"),
                 "success": result["success"],
@@ -467,7 +538,6 @@ def replay_workflow(
 
 def _capture_replay_recovery_snapshot(sandbox: Path, journal: TaskJournal, observer) -> dict:
     try:
-        from .bridge import RevitBridgeClient
         from .recovery import capture_recovery_snapshot
 
         return capture_recovery_snapshot(
@@ -783,8 +853,6 @@ def _with_active_document(sandbox: Path, status: dict) -> dict:
     if "active_document" in status:
         return status
     try:
-        from .bridge import RevitBridgeClient
-
         active_document = RevitBridgeClient(sandbox).active_document_status()
     except Exception as exc:
         active_document = {
@@ -1100,12 +1168,28 @@ def _button_label(value: str) -> str:
     return _clean_text(value).lower()
 
 
+def _classify_step(command: str, payload: dict, target: dict | None) -> SafetyDecision:
+    """Classify a replay step. A request-operation approval also covers the Revit process the replay targets."""
+    if command == "request-operation":
+        return classify_operation(payload, target)
+    return classify_action(command, payload)
+
+
+def _target_required(command: str, payload: dict, target: dict | None) -> bool:
+    """Whether request-operation refuses this step for not naming the Revit process it is for."""
+    operation = str(payload.get("operation") or "").strip().lower()
+    return command == "request-operation" and target is None and operation in TARGET_REQUIRED_OPERATIONS
+
+
 def _execute_replay_step(
     journal: TaskJournal,
     observer,
     command: str,
     payload: dict,
     approval_token: str | None,
+    *,
+    target_hwnd: int | None = None,
+    target_pid: int | None = None,
 ) -> dict:
     if command in EXECUTABLE_REPLAY_ACTIONS:
         from .actions import ActionRequest, SafeActionExecutor
@@ -1119,8 +1203,6 @@ def _execute_replay_step(
             )
         )
     if command == "request-operation":
-        from .operations import OperationRequest, queue_operation
-
         return queue_operation(
             journal,
             OperationRequest(
@@ -1130,6 +1212,9 @@ def _execute_replay_step(
                 approval_token=approval_token,
                 allow_model_write=bool(payload.get("allow_model_write")),
                 allow_sync=bool(payload.get("allow_sync")),
+                # queue_operation resolves the target again, so a process that changed since the plan fails its check.
+                target_hwnd=target_hwnd,
+                target_pid=target_pid,
             ),
         )
     return {"success": False, "error": f"Command {command!r} is not replay-executable."}

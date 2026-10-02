@@ -87,6 +87,8 @@ from tools.revit_operator.transport_safety import (
     build_transport_safety_matrix,
 )
 from tools.revit_operator.ui_workflows import (
+    BRIDGE_TARGET_COMMANDS,
+    UI_WORKFLOWS,
     list_ui_workflows,
     plan_ui_workflow,
     run_ui_workflow,
@@ -20707,9 +20709,10 @@ def _start_bridge_session(
     title: str = "Target Model",
     honors_targets: bool = True,
     status: str = "started",
+    started: str = _SESSION_STARTED,
 ) -> None:
     """Write the per-process status files that a running add-in keeps for one Revit process."""
-    addin = _current_bridge_addin(pid)
+    addin = _current_bridge_addin(pid, started=started)
     if honors_targets:
         addin["supports_command_targets"] = True
     bridge_dir = sandbox / "bridge"
@@ -21377,6 +21380,393 @@ def test_cli_qa_workflow_runs_against_target_window(tmp_path, capsys, monkeypatc
     assert captured == [("ui_tree", 4242), ("screenshot", 4242)]
     assert json.loads(Path(output["metadata_path"]).read_text(encoding="utf-8"))["document"]["title"] == "Target Model"
     assert "- Title: Target Model" in Path(output["qa_report_path"]).read_text(encoding="utf-8")
+
+
+_TARGET_222 = {"process_id": 222, "process_start_utc": _SESSION_STARTED}
+_ACTIVATE_SHEET_PAYLOAD = {
+    "operation": "activate-view",
+    "args": {"sheet_number": "S2.0"},
+    "allow_model_write": False,
+    "allow_sync": False,
+}
+
+
+class _IdleRevit:
+    def status(self):
+        return {
+            "state": "idle",
+            "active_dialogs": [],
+            "main_window": {"hwnd": 1, "title": "Autodesk Revit 2025"},
+            "revit_running": True,
+        }
+
+    def list_dialogs(self):
+        return {"supported": True, "dialogs": []}
+
+
+def _restart_bridge_session(monkeypatch, sandbox: Path, pid: int) -> None:
+    """Replace a Revit process with a later one that reuses its id; every other process has exited."""
+    restarted_at = datetime(2026, 10, 2, 13, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(bridge_module, "_process_start_utc", lambda live: restarted_at if live == pid else None)
+    _start_bridge_session(sandbox, pid, started="2026-10-02T13:00:00.0000000Z")
+
+
+def _queued_lines(sandbox: Path) -> list[dict]:
+    queue = sandbox / "bridge" / "command_queue.jsonl"
+    return [json.loads(line) for line in queue.read_text(encoding="utf-8").splitlines()] if queue.exists() else []
+
+
+def _answer_bridge_waits(monkeypatch) -> list[tuple]:
+    """Answer every bridge wait at once, recording the command and the Revit process whose results it reads."""
+    waits = []
+
+    def wait(self, command_id, *, timeout=60.0, poll=1.0):
+        waits.append((command_id, self.target_pid))
+        return {"success": True, "found": True, "checks": 1, "result": {"id": command_id, "success": True}}
+
+    monkeypatch.setattr(RevitBridgeClient, "wait_for_command_result", wait)
+    return waits
+
+
+def _open_sheet_runner(sandbox: Path):
+    """Run the recipe's request-operation step through the CLI, as run-ui-workflow does, and answer the others."""
+    run_command = cli._ui_workflow_command_runner(
+        sandbox,
+        parent_task_id="open-sheet",
+        allow_sandbox_outside_safe_root=True,
+    )
+    return lambda argv, index: run_command(argv, index) if argv[0] == "request-operation" else {"success": True}
+
+
+def _execute_session_item_argv(sandbox: Path, task_id: str, material: str, item_id: str, *extra: str) -> list[str]:
+    return [
+        "--sandbox",
+        str(sandbox),
+        "--allow-sandbox-outside-safe-root",
+        "--task-id",
+        task_id,
+        "agent-session-execute-approved-item",
+        "--approval-material",
+        material,
+        "--item-id",
+        item_id,
+        "--execute",
+        "--confirmation",
+        f"I approve {item_id}",
+        "--bridge-refresh-timeout",
+        "0",
+        *extra,
+    ]
+
+
+def test_agent_session_approval_plan_binds_model_change_tokens_to_the_target(tmp_path, capsys, monkeypatch):
+    _live_revit_processes(monkeypatch, 222)
+    _start_bridge_session(tmp_path, 222, title="Target Model")
+    objective = "Reload links and update project info parameters."
+    parameters = {"parameter_name": "Project Status", "parameter_value": "QA Draft"}
+    argv = ["--sandbox", str(tmp_path), "--allow-sandbox-outside-safe-root", "--task-id"]
+    plan_argv = ["agent-session-approval-plan", "--objective", objective, "--parameters-json", json.dumps(parameters)]
+
+    untargeted = agent_session.build_agent_session_approval_plan(
+        TaskJournal(tmp_path, "session-approval-untargeted"),
+        objective=objective,
+        parameters=parameters,
+    )
+    # request-operation refuses these untargeted, so the packet lists the live sessions instead of unusable tokens.
+    blocked = {item["id"]: item for item in untargeted["blocked_items"]}
+    for item_id in ("model-change:reload-links", "model-change:set-project-info-parameter"):
+        assert blocked[item_id]["target_required"] is True
+        assert "pass --hwnd or --pid" in blocked[item_id]["reason"]
+        assert "pid 222 (Target Model)" in blocked[item_id]["reason"]
+    untargeted_material = json.loads(Path(untargeted["private_material_path"]).read_text(encoding="utf-8"))
+    assert not [item for item in untargeted_material["approval_items"] if item["kind"] == "model-change-operation"]
+
+    assert cli.main([*argv, "session-approval-targeted", *plan_argv, "--pid", "222"]) == 0
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
+    assert "APPROVE:" not in stdout
+    assert output["target"] == _TARGET_222
+    assert output["target_session"]["document"]["title"] == "Target Model"
+    material = json.loads(Path(output["private_material_path"]).read_text(encoding="utf-8"))
+    items = {item["id"]: item for item in material["approval_items"]}
+    for operation, args in (
+        ("reload-links", {}),
+        ("set-project-info-parameter", {"name": "Project Status", "value": "QA Draft"}),
+    ):
+        item = items[f"model-change:{operation}"]
+        payload = {"operation": operation, "args": args, "allow_model_write": True, "allow_sync": False}
+        # The token is the one request-operation expects in this Revit process, and the command names the process.
+        assert item["revit_target"] == _TARGET_222
+        assert item["approval_token"] == _targeted_token(payload, 222)
+        assert item["execute_command"].endswith("--pid 222")
+    # A UI step's token does not cover a Revit process, so it carries none.
+    assert items["ui:manage-links-inspection:step:2"]["revit_target"] is None
+
+    assert cli.main([*argv, "session-approval-exited", *plan_argv, "--pid", "444"]) == 2
+    assert "Process 444 is not running" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_agent_session_executes_an_approved_change_in_the_revit_it_was_approved_for(tmp_path, capsys, monkeypatch):
+    _live_revit_processes(monkeypatch, 222, 333)
+    _start_bridge_session(tmp_path, 222, title="Target Model")
+    _start_bridge_session(tmp_path, 333, title="Other Agent Model")
+    monkeypatch.setattr(cli, "RevitWindowObserver", _IdleRevit)
+    waits = _answer_bridge_waits(monkeypatch)
+    approval = agent_session.build_agent_session_approval_plan(
+        TaskJournal(tmp_path, "session-approval-source"),
+        objective="Reload links if approved.",
+        target_pid=222,
+    )
+
+    # Without --hwnd/--pid, the item runs in the Revit process it was approved for.
+    code = cli.main(
+        _execute_session_item_argv(
+            tmp_path, "session-execute", approval["private_material_path"], "model-change:reload-links"
+        )
+    )
+
+    stdout = capsys.readouterr().out
+    output = json.loads(stdout)
+    assert code == 0
+    assert "APPROVE:" not in stdout
+    assert output["status"] == "executed"
+    receipt = output["execution"]["receipt"]
+    assert receipt["approved_target"] == receipt["queued_target"] == _TARGET_222
+    # The preflight refresh, the change and the post-action refresh all go to the approved process.
+    assert [(line["operation"], line.get("target")) for line in _queued_lines(tmp_path)] == [
+        ("active-document", _TARGET_222),
+        ("reload-links", _TARGET_222),
+        ("active-document", _TARGET_222),
+    ]
+    # Every wait read the approved process's results only.
+    assert {pid for _command_id, pid in waits} == {222}
+
+
+@pytest.mark.parametrize("change", ["other process", "same pid restarted"])
+def test_agent_session_refuses_an_approved_change_once_its_revit_changed(tmp_path, capsys, monkeypatch, change):
+    _live_revit_processes(monkeypatch, 222, 333)
+    _start_bridge_session(tmp_path, 222)
+    _start_bridge_session(tmp_path, 333, title="Other Agent Model")
+    monkeypatch.setattr(cli, "RevitWindowObserver", _IdleRevit)
+    _answer_bridge_waits(monkeypatch)
+    approval = agent_session.build_agent_session_approval_plan(
+        TaskJournal(tmp_path, "session-approval-source"),
+        objective="Reload links if approved.",
+        target_pid=222,
+    )
+    if change == "other process":
+        extra = ["--pid", "333"]
+    else:
+        _restart_bridge_session(monkeypatch, tmp_path, 222)
+        extra = []
+
+    cli.main(
+        _execute_session_item_argv(
+            tmp_path, "session-execute-changed", approval["private_material_path"], "model-change:reload-links", *extra
+        )
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "stopped_refused"
+    assert output["execution"]["executed"] is False
+    assert "approval token" in output["execution"]["dry_run_result"]["error"]
+    assert "approved for Revit process 222" in output["reason"]
+    assert [line["operation"] for line in _queued_lines(tmp_path)] == ["active-document"]
+
+
+def test_workflow_replay_queues_recorded_changes_for_the_planned_revit(tmp_path, capsys, monkeypatch):
+    _live_revit_processes(monkeypatch, 222, 333)
+    _start_bridge_session(tmp_path, 222)
+    _start_bridge_session(tmp_path, 333, title="Other Agent Model")
+    monkeypatch.setattr(cli, "RevitWindowObserver", _IdleRevit)
+    payload = _set_parameter_payload()
+    recorded_token = _targeted_token(payload, 333)
+    # Record the workflow from a run that changed the model in Revit process 333.
+    recorded_argv = _set_parameter_argv(
+        tmp_path, "recorded-change", "--pid", "333", "--execute", "--approval-token", recorded_token
+    )
+    assert cli.main(recorded_argv) == 0
+    capsys.readouterr()
+    assert record_workflow(tmp_path, source_task_id="recorded-change", name="Set Status")["success"] is True
+    argv = ["--sandbox", str(tmp_path), "--allow-sandbox-outside-safe-root", "--task-id"]
+
+    # Untargeted, the change cannot be approved at all: request-operation would refuse to queue it.
+    assert cli.main([*argv, "plan-untargeted", "workflow-approval-plan", "--name", "Set Status"]) == 0
+    untargeted = json.loads(capsys.readouterr().out)
+    assert untargeted["approval_tokens_json"] == {}
+    assert untargeted["blocked_steps"][0]["target_required"] is True
+    assert "pass --hwnd or --pid" in untargeted["blocked_steps"][0]["reason"]
+    assert untargeted["replay_execute_command_requires_human"] is None
+
+    assert cli.main([*argv, "plan-targeted", "workflow-approval-plan", "--name", "Set Status", "--pid", "222"]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["target"] == _TARGET_222
+    assert plan["approval_tokens_json"] == {"0": _targeted_token(payload, 222)}
+    assert "--pid 222 --execute" in plan["replay_execute_command_requires_human"]
+
+    def replay(task_id: str, pid: str) -> dict:
+        tokens = json.dumps(plan["approval_tokens_json"])
+        cli.main(
+            [
+                *argv,
+                task_id,
+                "replay-workflow",
+                "--name",
+                "Set Status",
+                "--execute",
+                "--approval-tokens-json",
+                tokens,
+                "--no-recovery-snapshot",
+                "--pid",
+                pid,
+            ]
+        )
+        return json.loads(capsys.readouterr().out)
+
+    # The tokens cover process 222, so replaying them in the process the workflow was recorded in is refused.
+    refused = replay("replay-other-process", "333")
+    assert refused["success"] is False
+    assert "approval token" in refused["stop_reason"]
+    replayed = replay("replay-planned-process", "222")
+    assert replayed["success"] is True
+    assert replayed["executed_steps"] == [0]
+    assert [line["target"]["process_id"] for line in _queued_lines(tmp_path)] == [333, 222]
+
+
+def test_run_ui_workflow_queues_the_open_sheet_step_for_the_planned_revit(tmp_path, capsys, monkeypatch):
+    _live_revit_processes(monkeypatch, 222)
+    _start_bridge_session(tmp_path, 222)
+    plan_argv = [
+        "--sandbox",
+        str(tmp_path),
+        "--allow-sandbox-outside-safe-root",
+        "--task-id",
+        "open-sheet-plan",
+        "plan-ui-workflow",
+        "--name",
+        "project-browser-open-sheet",
+        "--sheet-number",
+        "S2.0",
+        "--pid",
+        "222",
+    ]
+
+    assert cli.main(plan_argv) == 0
+    steps = json.loads(capsys.readouterr().out)["steps"]
+    token = steps[3]["policy"]["approval_token"]
+    # The step's token is the one request-operation checks in this Revit process, and the step names the process.
+    assert token == _targeted_token(_ACTIVATE_SHEET_PAYLOAD, 222)
+    # status and wait-model-ready check that process too; the project browser plan reads no bridge status.
+    assert [step["command"] for step in steps if step["args"][-2:] == ["--pid", "222"]] == [
+        "status",
+        "wait-model-ready",
+        "request-operation",
+    ]
+
+    def run(task_id: str) -> dict:
+        return run_ui_workflow(
+            TaskJournal(tmp_path, task_id),
+            name="project-browser-open-sheet",
+            parameters={"sheet_number": "S2.0"},
+            dry_run=False,
+            approval_tokens={3: token},
+            observe_func=lambda: {"state": "idle", "active_dialogs": []},
+            command_runner=_open_sheet_runner(tmp_path),
+            target_pid=222,
+        )
+
+    executed = run("open-sheet-run")
+    assert executed["success"] is True
+    assert executed["approved_executed_steps"] == [3]
+    assert _queued_lines(tmp_path)[-1]["target"] == _TARGET_222
+
+    # After a restart the id names a later process, which the approved token does not cover.
+    _restart_bridge_session(monkeypatch, tmp_path, 222)
+    refused = run("open-sheet-after-restart")
+    assert refused["success"] is False
+    assert refused["skipped_steps"] == [3]
+    assert "approval token" in refused["stop_reason"].lower()
+    assert len(_queued_lines(tmp_path)) == 1
+
+
+def test_run_ui_workflow_open_sheet_token_is_the_one_request_operation_checks(tmp_path):
+    plan = plan_ui_workflow(
+        TaskJournal(tmp_path, "open-sheet-untargeted-plan"),
+        name="project-browser-open-sheet",
+        parameters={"sheet_number": "S2.0"},
+    )
+    token = plan["steps"][3]["policy"]["approval_token"]
+
+    result = run_ui_workflow(
+        TaskJournal(tmp_path, "open-sheet-untargeted-run"),
+        name="project-browser-open-sheet",
+        parameters={"sheet_number": "S2.0"},
+        dry_run=False,
+        approval_tokens={3: token},
+        observe_func=lambda: {"state": "idle", "active_dialogs": []},
+        command_runner=_open_sheet_runner(tmp_path),
+    )
+
+    assert token == classify_action("request-operation", _ACTIVATE_SHEET_PAYLOAD).approval_token
+    assert result["success"] is True
+    # activate-view does not require a target, so the untargeted step still queues for every session.
+    assert [line["operation"] for line in _queued_lines(tmp_path)] == ["activate-view"]
+    assert "target" not in _queued_lines(tmp_path)[0]
+
+
+def test_targeted_recipes_pass_the_target_to_every_step_that_takes_one():
+    parser = cli.build_parser()
+    commands = next(action.choices for action in parser._actions if isinstance(getattr(action, "choices", None), dict))
+    parameters = {
+        "sheet_number": "S2.0",
+        "view_name": "STARTING VIEW",
+        "target_name": "Project Browser",
+        "target_control_type": "Pane",
+        "workflow_name": "Live Readonly QA Workflow",
+    }
+
+    for recipe in UI_WORKFLOWS.values():
+        for step in recipe.steps:
+            # A recipe command that takes the bridge --pid gets the target, and no other command does.
+            takes_target = "--pid" in commands[step.command]._option_string_actions
+            assert takes_target == (step.command in BRIDGE_TARGET_COMMANDS), (recipe.name, step.command)
+            rendered = step.render(parameters, _TARGET_222)
+            if takes_target:
+                assert parser.parse_args([step.command, *rendered["args"]]).pid == 222, (recipe.name, step.command)
+            else:
+                assert "--pid" not in rendered["args"], (recipe.name, step.command)
+
+
+def test_agent_session_open_sheet_item_runs_in_the_revit_it_was_approved_for(tmp_path, monkeypatch):
+    _live_revit_processes(monkeypatch, 222)
+    _start_bridge_session(tmp_path, 222)
+    approval = agent_session.build_agent_session_approval_plan(
+        TaskJournal(tmp_path, "open-sheet-approval"),
+        objective="Open sheet S2.0 from the project browser.",
+        parameters={"sheet_number": "S2.0"},
+        target_pid=222,
+    )
+    material = json.loads(Path(approval["private_material_path"]).read_text(encoding="utf-8"))
+    item = next(item for item in material["approval_items"] if item["id"] == "ui:project-browser-open-sheet:step:3")
+    assert item["revit_target"] == _TARGET_222
+    assert item["approval_token"] == _targeted_token(_ACTIVATE_SHEET_PAYLOAD, 222)
+    assert item["execute_command"].endswith("--pid 222")
+
+    result = agent_session.execute_agent_session_approved_item(
+        TaskJournal(tmp_path, "open-sheet-execute"),
+        _IdleRevit(),
+        RevitBridgeClient(tmp_path),
+        approval_material_path=Path(approval["private_material_path"]),
+        item_id=item["id"],
+        execute=True,
+        confirmation=f"I approve {item['id']}",
+        bridge_refresh_timeout=0,
+        ui_command_runner=_open_sheet_runner(tmp_path),
+    )
+
+    assert result["status"] == "executed"
+    assert _queued_lines(tmp_path)[-1]["operation"] == "activate-view"
+    assert _queued_lines(tmp_path)[-1]["target"] == _TARGET_222
 
 
 def test_bridge_readiness_requires_restart_when_installed_but_loaded_stale(tmp_path):
@@ -24869,12 +25259,15 @@ def test_cli_exposes_agent_session_run_command(tmp_path, capsys, monkeypatch):
     assert "APPROVE:" not in stdout
 
 
-def test_agent_session_approval_plan_keeps_tokens_private(tmp_path):
+def test_agent_session_approval_plan_keeps_tokens_private(tmp_path, monkeypatch):
+    _live_revit_processes(monkeypatch, 222)
+    _start_bridge_session(tmp_path, 222)
     journal = TaskJournal(tmp_path, "agent-session-approval-plan-test")
     result = agent_session.build_agent_session_approval_plan(
         journal,
         objective="Use Manage Links, reload links if approved, and update project info parameters.",
         parameters={"parameter_name": "Project Status", "parameter_value": "QA Draft"},
+        target_pid=222,
     )
 
     public_text = (journal.run_dir / "agent_session_approval_plan.json").read_text(encoding="utf-8")
@@ -24913,7 +25306,7 @@ def test_cli_exposes_agent_session_approval_plan_with_redacted_stdout(tmp_path, 
     assert "APPROVE:" in private_path.read_text(encoding="utf-8")
 
 
-def test_agent_session_execute_approved_model_change_dry_run_redacts_tokens(tmp_path):
+def test_agent_session_execute_approved_model_change_dry_run_redacts_tokens(tmp_path, monkeypatch):
     class FakeObserver:
         def status(self):
             return {
@@ -24926,10 +25319,13 @@ def test_agent_session_execute_approved_model_change_dry_run_redacts_tokens(tmp_
         def list_dialogs(self):
             return {"supported": True, "dialogs": []}
 
+    _live_revit_processes(monkeypatch, 222)
+    _start_bridge_session(tmp_path, 222)
     approval_journal = TaskJournal(tmp_path, "approval-source")
     approval = agent_session.build_agent_session_approval_plan(
         approval_journal,
         objective="Reload links if approved.",
+        target_pid=222,
     )
     run_journal = TaskJournal(tmp_path, "approved-item-dry-run")
     result = agent_session.execute_agent_session_approved_item(
@@ -24945,7 +25341,10 @@ def test_agent_session_execute_approved_model_change_dry_run_redacts_tokens(tmp_
     assert result["success"] is True
     assert result["status"] == "ready_for_approval_execution"
     assert result["execution"]["executed"] is False
-    assert result["execution"]["pre_action_active_document"]["available"] is False
+    # The approved Revit's own document, not whichever session wrote the shared file last.
+    assert result["execution"]["pre_action_active_document"]["status_source"] == "process"
+    assert result["execution"]["pre_action_active_document"]["document"]["document"]["title"] == "Target Model"
+    assert result["execution"]["dry_run_result"]["authorization"]["allowed"] is True
     assert result["execution"]["post_action_refresh"] is None
     assert result["execution"]["receipt"]["post_action_refresh_requested"] is False
     assert "APPROVE:" not in json.dumps(result)
@@ -24967,10 +25366,13 @@ def test_agent_session_execute_approved_model_change_requires_exact_confirmation
         def list_dialogs(self):
             return {"supported": True, "dialogs": []}
 
+    _live_revit_processes(monkeypatch, 222)
+    _start_bridge_session(tmp_path, 222)
     approval_journal = TaskJournal(tmp_path, "approval-source-confirm")
     approval = agent_session.build_agent_session_approval_plan(
         approval_journal,
         objective="Reload links if approved.",
+        target_pid=222,
     )
     calls = []
 
@@ -25032,6 +25434,8 @@ def test_agent_session_execute_approved_model_change_requires_exact_confirmation
     assert model_calls
     assert refresh_calls
     assert model_calls[-1].approval_token.startswith("APPROVE:")
+    # The change and its refresh go to the Revit process the item was approved for.
+    assert model_calls[-1].target_pid == refresh_calls[-1].target_pid == 222
     assert executed["execution"]["receipt"]["post_action_refresh_requested"] is True
     assert executed["execution"]["post_action_refresh"]["command"]["operation"] == "active-document"
     assert "APPROVE:" not in json.dumps(executed)
@@ -25100,9 +25504,12 @@ def test_cli_exposes_agent_session_execute_approved_item_dry_run(tmp_path, capsy
             return {"supported": True, "dialogs": []}
 
     monkeypatch.setattr(cli, "RevitWindowObserver", lambda: FakeObserver())
+    _live_revit_processes(monkeypatch, 222)
+    _start_bridge_session(tmp_path, 222)
     approval = agent_session.build_agent_session_approval_plan(
         TaskJournal(tmp_path, "approval-source-cli"),
         objective="Reload links if approved.",
+        target_pid=222,
     )
     code = cli.main(
         [

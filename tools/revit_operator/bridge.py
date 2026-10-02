@@ -60,6 +60,9 @@ class RevitBridgeClient:
             "active_document": self.bridge_dir / f"active_document.{pid}.json",
         }
 
+    def process_metadata_snapshot_path(self, pid: int) -> Path:
+        return self.bridge_dir / f"metadata_snapshot.{pid}.json"
+
     def bridge_status(self) -> dict:
         return self._bridge_status(self._status_selection())
 
@@ -456,15 +459,27 @@ class RevitBridgeClient:
         if error:
             return {"success": False, "error": error}
 
+        selection = self.metadata_snapshot_selection()
+        source_fields = metadata_snapshot_fields(selection)
+        snapshot_path = selection["path"]
+        if snapshot_path is None:
+            return {
+                "success": False,
+                "status": "other_process_snapshot",
+                "error": selection["error"],
+                "read_only": True,
+                **source_fields,
+            }
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        if self.metadata_snapshot_path.exists():
-            shutil.copyfile(self.metadata_snapshot_path, output_path)
+        if snapshot_path.exists():
+            shutil.copyfile(snapshot_path, output_path)
             return {
                 "success": True,
-                "source": str(self.metadata_snapshot_path),
+                "source": str(snapshot_path),
                 "path": str(output_path),
                 "mode": "bridge_snapshot_copy",
                 "read_only": True,
+                **source_fields,
             }
 
         stub = {
@@ -494,7 +509,54 @@ class RevitBridgeClient:
             "path": str(output_path),
             "mode": "stub",
             "read_only": True,
+            **source_fields,
         }
+
+    def metadata_snapshot_selection(self) -> dict:
+        """Pick the target process's own metadata snapshot, falling back to the shared snapshot.
+
+        Every export also writes the shared snapshot, an untargeted one in every Revit on the bridge, so it holds
+        whichever export landed last. The add-in also writes metadata_snapshot.<pid>.json, which only that process
+        writes. A shared snapshot that names another writer process is refused: "path" is None and "error" says whose
+        it is.
+        """
+        target = {"hwnd": self.target_hwnd, "pid": self.target_pid}
+        if not self.target_pid:
+            return {"source": "shared", "path": self.metadata_snapshot_path, "target": target}
+        pid = self.target_pid
+        path = self.process_metadata_snapshot_path(pid)
+        snapshot = self._read_json_file(path)
+        if snapshot.get("available") is True:
+            writer = _other_writer(pid, _payload_addin(snapshot))
+            if writer is None:
+                return {"source": "process", "path": path, "target": target}
+            reason = f"The per-process metadata snapshot for process {pid} was written by {writer}."
+        elif snapshot.get("status") == "missing":
+            reason = (
+                f"Revit process {pid} wrote no per-process metadata snapshot: it has not exported metadata, or it "
+                "runs an add-in build older than per-process snapshots, so the shared snapshot may describe another "
+                "session."
+            )
+        else:
+            reason = f"The per-process metadata snapshot for process {pid} is unreadable ({snapshot.get('status')})."
+        selection = {
+            "source": "shared_fallback",
+            "path": self.metadata_snapshot_path,
+            "target": target,
+            "fallback_reason": reason,
+        }
+        # Builds older than per-process snapshots do not name the writer, so their shared snapshot may be the target's.
+        shared = self._read_json_file(self.metadata_snapshot_path)
+        writer = _other_writer(pid, _payload_addin(shared))
+        if writer is not None:
+            selection["path"] = None
+            selection["writer_process_id"] = _payload_process_id(shared)
+            selection["error"] = (
+                f"The shared metadata snapshot does not describe target Revit process {pid}: it was written by "
+                f"{writer}. Queue export-metadata with request-operation --pid {pid} so the target writes its own "
+                "snapshot."
+            )
+        return selection
 
     def read_command_results(self) -> list[dict]:
         if not self.command_results_path.exists():
@@ -748,17 +810,26 @@ def _process_identity_mismatch(pid: int, payloads: dict) -> str | None:
         addin = _payload_addin(payload)
         if not addin:
             continue
-        reported_pid = addin.get("process_id")
-        if reported_pid is not None and reported_pid != pid:
-            return f"The per-process status files for process {pid} name process {reported_pid}."
-        reported_start = _parse_utc(addin.get("process_start_utc"))
-        live_start = _process_start_utc(pid) if reported_start else None
-        if live_start and abs((reported_start - live_start).total_seconds()) > PROCESS_START_TOLERANCE_SECONDS:
-            return (
-                f"The per-process status files for process {pid} were written by an earlier process "
-                f"(started {reported_start.isoformat()}); the id now belongs to one started {live_start.isoformat()}."
-            )
-        return None
+        writer = _other_writer(pid, addin)
+        return f"The per-process status files for process {pid} were written by {writer}." if writer else None
+    return None
+
+
+def _other_writer(pid: int, addin: dict) -> str | None:
+    """Describe the writer of a payload whose add-in block names a process other than the live one with this id.
+
+    Returns None when the block names this process, or names no process (builds that predate the field).
+    """
+    reported_pid = addin.get("process_id")
+    if reported_pid is not None and reported_pid != pid:
+        return f"process {reported_pid}"
+    reported_start = _parse_utc(addin.get("process_start_utc"))
+    live_start = _process_start_utc(pid) if reported_start else None
+    if live_start and abs((reported_start - live_start).total_seconds()) > PROCESS_START_TOLERANCE_SECONDS:
+        return (
+            f"an earlier process (started {reported_start.isoformat()}); the id now belongs to one started "
+            f"{live_start.isoformat()}"
+        )
     return None
 
 
@@ -766,6 +837,15 @@ def _status_source_fields(selection: dict) -> dict:
     fields = {"status_source": selection["source"], "target": selection["target"]}
     if selection.get("fallback_reason"):
         fields["fallback_reason"] = selection["fallback_reason"]
+    return fields
+
+
+def metadata_snapshot_fields(selection: dict) -> dict:
+    """Say which process's metadata snapshot a read used and, after a fallback, why."""
+    fields = {"snapshot_source": selection["source"], "target": selection["target"]}
+    for key in ("fallback_reason", "writer_process_id"):
+        if selection.get(key) is not None:
+            fields[key] = selection[key]
     return fields
 
 

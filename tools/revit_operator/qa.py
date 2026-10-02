@@ -5,14 +5,22 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .bridge import RevitBridgeClient, metadata_snapshot_fields
 from .constants import DRAFT_LABEL
 from .journal import TaskJournal, utc_now
 from .safety import validate_output_path
 
 
-def generate_qa_report(journal: TaskJournal, output: Path | None = None) -> dict:
-    metadata_path = journal.sandbox / "bridge" / "metadata_snapshot.json"
-    if not metadata_path.exists():
+def generate_qa_report(
+    journal: TaskJournal,
+    output: Path | None = None,
+    bridge: RevitBridgeClient | None = None,
+) -> dict:
+    # A targeted bridge prefers the snapshot its target process exported over the shared one.
+    selection = (bridge or RevitBridgeClient(journal.sandbox)).metadata_snapshot_selection()
+    source_fields = metadata_snapshot_fields(selection)
+    metadata_path = selection["path"]
+    if metadata_path is None or not metadata_path.exists():
         metadata_path = _latest_metadata_file(journal)
 
     metadata = {}
@@ -64,7 +72,7 @@ def generate_qa_report(journal: TaskJournal, output: Path | None = None) -> dict
     journal.write_entry(
         {
             "command": "qa-report",
-            "requested_action": {"metadata_source": source},
+            "requested_action": {"metadata_source": source, **source_fields},
             "risk_classification": {
                 "action": "qa-report",
                 "risk": "low",
@@ -81,6 +89,7 @@ def generate_qa_report(journal: TaskJournal, output: Path | None = None) -> dict
         "success": True,
         "path": str(output_path),
         "metadata_source": source,
+        **source_fields,
         "findings": findings,
     }
 

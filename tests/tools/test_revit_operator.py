@@ -21304,48 +21304,79 @@ def test_cli_metadata_readers_read_target_window_snapshot(tmp_path, capsys, monk
     assert Path(output.get("metadata_source") or output["source"]).name == "metadata_snapshot.222.json"
 
 
-def test_readonly_qa_workflow_copies_and_reports_target_process_snapshot(tmp_path, monkeypatch):
+def test_cli_qa_workflow_runs_against_target_window(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(bridge_module, "process_id_for_hwnd", lambda hwnd: {4242: 222}.get(hwnd))
     monkeypatch.setattr(bridge_module, "_process_start_utc", lambda pid: None)
-    bridge = RevitBridgeClient(tmp_path, target_pid=222)
+    bridge_dir = tmp_path / "bridge"
     _write_bridge_payload(
-        bridge.process_metadata_snapshot_path(222),
+        bridge_dir / "metadata_snapshot.222.json",
         _metadata_snapshot("Target Model", addin=_current_bridge_addin(222)),
     )
     _write_bridge_payload(
-        bridge.metadata_snapshot_path,
+        bridge_dir / "metadata_snapshot.json",
         _metadata_snapshot("Other Model", addin=_current_bridge_addin(111)),
     )
-    # A targeted wait accepts only results that the target process wrote.
-    bridge.command_results_path.write_text(
+    # Another session's results land after the target's; the waits still take the target's.
+    (bridge_dir / "command_results.jsonl").write_text(
         "".join(
-            json.dumps({"id": command_id, "success": True, "process_id": 222}) + "\n"
-            for command_id in ["active-id", "metadata-id"]
+            json.dumps({"id": command_id, "success": True, "process_id": pid}) + "\n"
+            for pid in (222, 111)
+            for command_id in ("active-id", "metadata-id")
         ),
         encoding="utf-8",
     )
     command_ids = iter(["active-id", "metadata-id"])
-    monkeypatch.setattr(
-        workflows,
-        "queue_operation",
-        lambda _journal, request: {"success": True, "command": {"id": next(command_ids), "operation": request.operation}},
-    )
+    queued = []
+    captured = []
+
+    def fake_queue_operation(_journal, request):
+        queued.append(request)
+        return {"success": True, "command": {"id": next(command_ids), "operation": request.operation}}
 
     class FakeObserver:
         def status(self):
             return {"state": "idle", "active_dialogs": []}
 
-    result = run_readonly_qa_workflow(
-        TaskJournal(tmp_path, "workflow-target-process-test"),
-        FakeObserver(),
-        bridge,
-        timeout=0,
-        capture_screenshot=False,
-        capture_ui_tree=False,
+        def ui_tree(self, hwnd=None, max_depth=4):
+            captured.append(("ui_tree", hwnd))
+            return {"supported": True, "tree": {"title": "Revit"}}
+
+        def screenshot(self, output, hwnd=None):
+            captured.append(("screenshot", hwnd))
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(b"BM")
+            return {"success": True, "path": str(output), "format": "bmp"}
+
+    monkeypatch.setattr(workflows, "queue_operation", fake_queue_operation)
+    monkeypatch.setattr(cli, "RevitWindowObserver", lambda: FakeObserver())
+
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "qa-workflow-target-window-test",
+            "qa-workflow",
+            "--hwnd",
+            "4242",
+            "--timeout",
+            "0",
+        ]
     )
 
-    assert result["success"] is True
-    assert json.loads(Path(result["metadata_path"]).read_text(encoding="utf-8"))["document"]["title"] == "Target Model"
-    assert "- Title: Target Model" in Path(result["qa_report_path"]).read_text(encoding="utf-8")
+    assert code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["success"] is True
+    assert [(request.operation, request.target_hwnd, request.target_pid) for request in queued] == [
+        ("active-document", 4242, 222),
+        ("export-metadata", 4242, 222),
+    ]
+    waits = [step["wait_result"] for step in output["steps"] if step["step"].startswith("bridge-")]
+    assert [wait["result"]["process_id"] for wait in waits] == [222, 222]
+    assert captured == [("ui_tree", 4242), ("screenshot", 4242)]
+    assert json.loads(Path(output["metadata_path"]).read_text(encoding="utf-8"))["document"]["title"] == "Target Model"
+    assert "- Title: Target Model" in Path(output["qa_report_path"]).read_text(encoding="utf-8")
 
 
 def test_bridge_readiness_requires_restart_when_installed_but_loaded_stale(tmp_path):
@@ -23897,10 +23928,10 @@ def test_readonly_qa_workflow_runs_from_bridge_metadata(tmp_path, monkeypatch):
         def status(self):
             return {"state": "idle", "active_dialogs": []}
 
-        def ui_tree(self, max_depth=2):
+        def ui_tree(self, hwnd=None, max_depth=2):
             return {"supported": True, "tree": {"title": "Revit"}}
 
-        def screenshot(self, output):
+        def screenshot(self, output, hwnd=None):
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_bytes(b"BM")
             return {"success": True, "path": str(output), "format": "bmp"}

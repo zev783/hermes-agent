@@ -974,6 +974,17 @@ def build_parser() -> argparse.ArgumentParser:
     qa_workflow.add_argument("--focus-hwnd", type=int, help="Approved Revit window handle to focus before bridge waits.")
     qa_workflow.add_argument("--focus-approval-token", help="Exact focus approval token for --focus-hwnd.")
     qa_workflow.add_argument("--idle-nudge", action="store_true", help="Press Escape after focusing to prompt Revit Idling.")
+    _add_bridge_target_args(
+        qa_workflow,
+        hwnd_help=(
+            "Run the workflow against the Revit that owns this window: queue its bridge commands for that process "
+            "only, capture this window, and copy and report that process's own metadata snapshot."
+        ),
+        pid_help=(
+            "Run the workflow against this Revit process. Without --hwnd, the screenshot and UI tree still capture "
+            "the default Revit window."
+        ),
+    )
 
     agent_task = sub.add_parser(
         "agent-task",

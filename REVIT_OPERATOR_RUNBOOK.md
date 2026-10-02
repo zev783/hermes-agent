@@ -1359,6 +1359,12 @@ When Revit is open with no active dialogs and the add-in bridge is loaded:
 revit-operator qa-workflow --timeout 120 --poll 1
 ```
 
+When several Revit sessions share the bridge folder, name the one to check. Only that session then runs the workflow's bridge commands, and the screenshot, metadata copy and report come from it:
+
+```powershell
+revit-operator qa-workflow --timeout 120 --poll 1 --hwnd <main-window-hwnd>
+```
+
 If the currently running Revit session loaded an older add-in that only processes queued work after a UI event, first dry-run focus to get the exact token:
 
 ```powershell

@@ -48,6 +48,8 @@ class OperationRequest:
     # The Revit the operation is for, by window or process id. Other Revit sessions skip the queued line.
     target_hwnd: int | None = None
     target_pid: int | None = None
+    # The queued line's id, for wait-bridge-result. Not args["id"]: activate-view reads that as a view id.
+    command_id: str | None = None
 
 
 def validate_model_path(path: Path, allow_outside_safe_root: bool = False) -> str | None:
@@ -169,7 +171,7 @@ def queue_operation(journal: TaskJournal, request: OperationRequest) -> dict:
     target_check = {} if guard_error else _check_target(operation, bridge, resolution)
     guard_error = guard_error or target_check.pop("error", None)
 
-    command_id = request.args.get("id") or make_task_id(operation.replace("-", "_"))
+    command_id = request.command_id or make_task_id(operation.replace("-", "_"))
     command = {
         "id": command_id,
         "timestamp": utc_now(),

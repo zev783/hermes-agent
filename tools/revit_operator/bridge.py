@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sys
@@ -25,6 +26,7 @@ EXPECTED_BRIDGE_PROTOCOL_VERSION = "0.2"
 EXPECTED_SOURCE_CAPABILITY_STAMP = "continuous-idling-status-file-retry-v2"
 # A per-process status file belongs to the live process with that id only if their start times agree.
 PROCESS_START_TOLERANCE_SECONDS = 2.0
+_PROCESS_STATUS_FILE_NAME = re.compile(r"^(?:addin_status|addin_heartbeat)\.(\d+)\.json$")
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _FILETIME_EPOCH = datetime(1601, 1, 1, tzinfo=timezone.utc)
 
@@ -44,6 +46,7 @@ class RevitBridgeClient:
         self.heartbeat_path = self.bridge_dir / "addin_heartbeat.json"
         self.active_document_path = self.bridge_dir / "active_document.json"
         self.metadata_snapshot_path = self.bridge_dir / "metadata_snapshot.json"
+        self.command_queue_path = self.bridge_dir / "command_queue.jsonl"
         self.command_results_path = self.bridge_dir / "command_results.jsonl"
         # The shared status files are last-writer-wins across tandem Revit sessions. The add-in also writes
         # <name>.<pid>.json per process, and reads prefer those of the process that owns the target window.
@@ -375,6 +378,79 @@ class RevitBridgeClient:
             "note": "No in-process Revit add-in bridge payload is present yet.",
         }
 
+    def command_target(self) -> dict:
+        """Resolve the target window or process to the identity a queued command names.
+
+        The add-in runs a targeted line only in the process with this id, and the start time keeps a reused id from
+        matching. Both come from that process's own status files, so only a live Revit whose add-in polls this
+        bridge folder can be a target.
+        """
+        requested = {"hwnd": self.target_hwnd, "pid": self.target_pid}
+        if self.target_hwnd:
+            owner = process_id_for_hwnd(self.target_hwnd)
+            if owner is None:
+                return _target_failure(requested, f"Window {self.target_hwnd} does not exist.")
+            if owner != self.target_pid:
+                return _target_failure(
+                    requested,
+                    f"Window {self.target_hwnd} belongs to process {owner}, not process {self.target_pid}.",
+                )
+        pid = self.target_pid
+        if not pid:
+            return _target_failure(requested, "Name the target Revit with a window handle or a process id.")
+        if _process_start_utc(pid) is None:
+            return _target_failure(requested, f"Process {pid} is not running.")
+        selection = self._status_selection()
+        if selection["source"] != "process":
+            return _target_failure(requested, selection["fallback_reason"])
+        payloads = selection["payloads"]
+        if (payloads["addin_status"].get("payload") or {}).get("status") == "stopped":
+            return _target_failure(requested, f"The Hermes add-in in Revit process {pid} has stopped.")
+        addin = _payload_addin(payloads["addin_status"]) or _payload_addin(payloads["heartbeat"])
+        started = addin.get("process_start_utc")
+        if _parse_utc(started) is None:
+            return _target_failure(requested, f"The status files of Revit process {pid} do not say when it started.")
+        document = self._read_json_file(selection["paths"]["active_document"])
+        return {
+            "success": True,
+            "target": {"process_id": pid, "process_start_utc": started},
+            "requested": requested,
+            "session": {
+                "process_id": pid,
+                "honors_command_targets": addin.get("supports_command_targets") is True,
+                "document": _document_summary(document),
+            },
+        }
+
+    def bridge_sessions(self) -> list[dict]:
+        """List the Revit processes that write per-process status files to this bridge folder."""
+        try:
+            names = [entry.name for entry in os.scandir(self.bridge_dir)]
+        except OSError:
+            return []
+        pids = {int(match.group(1)) for match in map(_PROCESS_STATUS_FILE_NAME.match, names) if match}
+        sessions = []
+        for pid in sorted(pids):
+            paths = self.process_status_paths(pid)
+            payloads = {key: self._read_json_file(paths[key]) for key in ("addin_status", "heartbeat")}
+            addin = _payload_addin(payloads["addin_status"]) or _payload_addin(payloads["heartbeat"])
+            stopped = (payloads["addin_status"].get("payload") or {}).get("status") == "stopped"
+            live = (
+                not stopped
+                and _process_start_utc(pid) is not None
+                and _process_identity_mismatch(pid, payloads) is None
+            )
+            sessions.append(
+                {
+                    "process_id": pid,
+                    "live": live,
+                    "process_start_utc": addin.get("process_start_utc"),
+                    "honors_command_targets": addin.get("supports_command_targets") is True,
+                    "document": _document_summary(self._read_json_file(paths["active_document"])),
+                }
+            )
+        return sessions
+
     def export_metadata(self, output_path: Path) -> dict:
         error = validate_output_path(output_path, self.sandbox)
         if error:
@@ -440,11 +516,26 @@ class RevitBridgeClient:
                 results.append(payload)
         return results
 
-    def find_command_result(self, command_id: str) -> dict | None:
+    def find_command_result(self, command_id: str, *, process_id: int | None = None) -> dict | None:
         for result in reversed(self.read_command_results()):
-            if result.get("id") == command_id:
+            if result.get("id") == command_id and (process_id is None or _result_process_id(result) == process_id):
                 return result
         return None
+
+    def queued_command(self, command_id: str) -> dict | None:
+        """Return the last queued line with this id, or None."""
+        text, error = self._read_text_file(self.command_queue_path)
+        if error is not None:
+            return None
+        found = None
+        for line in text.splitlines():
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict) and payload.get("id") == command_id:
+                found = payload
+        return found
 
     def wait_for_command_result(
         self,
@@ -453,17 +544,38 @@ class RevitBridgeClient:
         timeout: float = 60.0,
         poll: float = 1.0,
     ) -> dict:
+        # Only the target answers a targeted command. Without --hwnd/--pid, the queued line names the target.
+        queued_target = (self.queued_command(command_id) or {}).get("target")
+        queued_pid = queued_target.get("process_id") if isinstance(queued_target, dict) else None
+        if self.target_pid and queued_pid and queued_pid != self.target_pid:
+            return {
+                "success": False,
+                "found": False,
+                "checks": 0,
+                "error": (
+                    f"Bridge command {command_id!r} targets Revit process {queued_pid}, "
+                    f"not process {self.target_pid}."
+                ),
+                "target_process_id": self.target_pid,
+                "queued_target": queued_target,
+            }
+        process_id = self.target_pid or queued_pid
         deadline = time.monotonic() + max(0.0, timeout)
         checks = 0
         while True:
             checks += 1
-            result = self.find_command_result(command_id)
+            results = [result for result in self.read_command_results() if result.get("id") == command_id]
+            result = next(
+                (item for item in reversed(results) if process_id is None or _result_process_id(item) == process_id),
+                None,
+            )
             if result is not None:
                 return {
                     "success": bool(result.get("success")),
                     "found": True,
                     "checks": checks,
                     "result": result,
+                    **_result_scope(process_id, results, targeted=queued_pid is not None),
                 }
             if time.monotonic() >= deadline:
                 return {
@@ -472,6 +584,7 @@ class RevitBridgeClient:
                     "checks": checks,
                     "error": f"Timed out waiting for bridge command result {command_id!r}.",
                     "command_results_path": str(self.command_results_path),
+                    **_result_scope(process_id, results, targeted=queued_pid is not None),
                 }
             time.sleep(max(0.1, poll))
 
@@ -654,6 +767,53 @@ def _status_source_fields(selection: dict) -> dict:
     if selection.get("fallback_reason"):
         fields["fallback_reason"] = selection["fallback_reason"]
     return fields
+
+
+def _target_failure(requested: dict, error: str) -> dict:
+    return {"success": False, "error": error, "requested": requested}
+
+
+def _document_summary(active_document: dict) -> dict | None:
+    payload = active_document.get("payload") if isinstance(active_document, dict) else None
+    document = payload.get("document") if isinstance(payload, dict) else None
+    if not isinstance(document, dict):
+        return None
+    return {"title": document.get("title"), "path": document.get("path")}
+
+
+def _result_process_id(result: dict):
+    """Return the id of the Revit process that wrote a command result, or None for builds that predate it."""
+    if result.get("process_id") is not None:
+        return result["process_id"]
+    addin = result.get("addin")
+    return addin.get("process_id") if isinstance(addin, dict) else None
+
+
+def _result_scope(process_id: int | None, results: list[dict], *, targeted: bool) -> dict:
+    """Say which processes answered a command, and warn when others answered a targeted one."""
+    if process_id is None:
+        reporters = sorted({pid for pid in map(_result_process_id, results) if pid is not None})
+        return {"reporting_process_ids": reporters} if len(reporters) > 1 else {}
+    others = [
+        {
+            "process_id": _result_process_id(result),
+            "success": result.get("success"),
+            "status": result.get("status"),
+            "error": result.get("error"),
+        }
+        for result in results
+        if _result_process_id(result) != process_id
+    ]
+    scope = {"target_process_id": process_id}
+    if others:
+        scope["other_process_results"] = others
+    # Every session runs an untargeted line, but only a build that ignores targets runs another process's line.
+    if others and targeted:
+        scope["warning"] = (
+            "Other Revit processes also answered this targeted command: their add-in build ignores command targets "
+            "and ran it too. Restart them on the current build."
+        )
+    return scope
 
 
 def _check_value(name: str, expected, actual, passed_reason: str) -> dict:

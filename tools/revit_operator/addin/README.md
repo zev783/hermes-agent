@@ -19,6 +19,26 @@ Every Revit that loads the add-in shares one bridge folder, so:
   last-writer-wins across tandem sessions and stay only for older readers.
   Give bridge commands `--hwnd` (or `--pid`) to read the session that owns a
   window.
+- A queued command can name the Revit it is for. `request-operation --hwnd`
+  (or `--pid`) records `"target": {"process_id", "process_start_utc"}` from
+  that process's own status files, and the approval token covers the target.
+  Only that process runs the line. The others skip it and write no result. If
+  the id now belongs to a later process (a reused PID), the line is refused
+  with `target_process_exited`.
+- Untargeted lines still run in every session, except operations that change
+  a model or the open documents: `open-model`, `close-model`, `save`, `sync`,
+  `synchronize-with-central`, `reload-links`, `modify-model` and
+  `set-project-info-parameter`. The add-in refuses those untargeted
+  (`target_required`), and `request-operation` will not queue them without
+  `--hwnd` or `--pid`.
+- Every command result carries the `process_id` and `process_start_utc` of
+  the process that wrote it. For a targeted command, `wait-bridge-result`
+  accepts only the target's result and flags answers from other processes.
+- Builds before command targets run every line, targeted or not. Restart
+  every session on the bridge on this build. Until then, `request-operation`
+  refuses a targeted change while a live session on the bridge writes
+  per-process status without `supports_command_targets`. Builds older than
+  per-process status files cannot be detected.
 - Commands queued more than 15 minutes before the Revit process started are
   skipped, not replayed. One `skipped_stale_commands` result lists them. A
   command queued just before launching Revit still runs.

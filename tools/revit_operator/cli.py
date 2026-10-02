@@ -710,6 +710,14 @@ def build_parser() -> argparse.ArgumentParser:
     wait_bridge.add_argument("--command-id", required=True)
     wait_bridge.add_argument("--timeout", type=float, default=60.0)
     wait_bridge.add_argument("--poll", type=float, default=1.0)
+    _add_bridge_target_args(
+        wait_bridge,
+        hwnd_help=(
+            "Accept only the result written by the Revit that owns this window. By default a targeted "
+            "command's queued target is used."
+        ),
+        pid_help="Accept only the result written by this Revit process.",
+    )
 
     recovery = sub.add_parser("recovery-snapshot", help="Capture stuck-state evidence and recovery guidance.")
     recovery.add_argument("--no-screenshot", action="store_true")
@@ -919,6 +927,7 @@ def build_parser() -> argparse.ArgumentParser:
     operation.add_argument("--save-before-close", action="store_true")
     operation.add_argument("--allow-model-write", action="store_true")
     operation.add_argument("--allow-sync", action="store_true")
+    _add_operation_target_args(operation)
 
     safe_command = sub.add_parser(
         "run-safe-command",
@@ -931,6 +940,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Read-only safe command name: active-document, export-metadata, or qa-snapshot.",
     )
     safe_command.add_argument("--args-json", default="{}")
+    _add_operation_target_args(safe_command)
 
     addin = sub.add_parser("install-addin", help="Install the Revit add-in manifest.")
     _add_action_flags(addin)
@@ -1251,13 +1261,25 @@ def _add_project_browser_visual_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_bridge_target_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--hwnd",
-        type=int,
-        help="Read the per-process bridge status of the Revit that owns this window.",
+def _add_bridge_target_args(
+    parser: argparse.ArgumentParser,
+    *,
+    hwnd_help: str = "Read the per-process bridge status of the Revit that owns this window.",
+    pid_help: str = "Read the per-process bridge status of this Revit process.",
+) -> None:
+    parser.add_argument("--hwnd", type=int, help=hwnd_help)
+    parser.add_argument("--pid", type=int, help=pid_help)
+
+
+def _add_operation_target_args(parser: argparse.ArgumentParser) -> None:
+    _add_bridge_target_args(
+        parser,
+        hwnd_help=(
+            "Queue the operation for the Revit that owns this window; other Revit sessions skip it. Required for "
+            "operations that change a model or the open documents."
+        ),
+        pid_help="Queue the operation for this Revit process; other Revit sessions skip it.",
     )
-    parser.add_argument("--pid", type=int, help="Read the per-process bridge status of this Revit process.")
 
 
 def _add_context_menu_args(parser: argparse.ArgumentParser) -> None:
@@ -2276,6 +2298,8 @@ def dispatch(args: argparse.Namespace) -> dict:
                     approval_token=args.approval_token,
                     allow_model_write=args.allow_model_write,
                     allow_sync=args.allow_sync,
+                    target_hwnd=args.hwnd,
+                    target_pid=args.pid,
                 ),
             ),
             "journal": journal.describe(),
@@ -2306,6 +2330,8 @@ def dispatch(args: argparse.Namespace) -> dict:
                     approval_token=args.approval_token,
                     allow_model_write=False,
                     allow_sync=False,
+                    target_hwnd=args.hwnd,
+                    target_pid=args.pid,
                 ),
             )
             result["safe_command"] = {

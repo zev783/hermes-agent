@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading;
 using Autodesk.Revit.ApplicationServices;
@@ -45,6 +46,22 @@ public class HermesRevitOperatorApp : IExternalApplication
     private UIApplication? _uiapp;
     private string _sandbox = "";
 
+    // Idling stays continuous (SetRaiseWithoutDelay), but the status files are rewritten at most once per
+    // interval, single-attempt, and each tick then yields until a message arrives. Rewriting them on every tick,
+    // with retry sleeps whenever another tandem Revit held the shared file, kept the UI thread busy or asleep, so
+    // every UI Automation request and window message to this Revit waited ~100-300 ms.
+    private const int StatusWriteIntervalMilliseconds = 1000;
+    private const uint IdleWaitMilliseconds = 20;
+    private const uint QsAllInput = 0x04FF;
+    private const uint MwmoInputAvailable = 0x0004;
+    private DateTime _lastStatusWriteUtc = DateTime.MinValue;
+    private long _queueLength = -1;
+    private DateTime _queueWriteUtc = DateTime.MinValue;
+    private DateTime _queueRetryAfterUtc = DateTime.MinValue;
+
+    [DllImport("user32.dll")]
+    private static extern uint MsgWaitForMultipleObjectsEx(uint nCount, IntPtr[]? pHandles, uint dwMilliseconds, uint dwWakeMask, uint dwFlags);
+
     public Result OnStartup(UIControlledApplication application)
     {
         _sandbox = ResolveSandbox();
@@ -72,33 +89,64 @@ public class HermesRevitOperatorApp : IExternalApplication
     private void OnIdling(object? sender, IdlingEventArgs args)
     {
         args.SetRaiseWithoutDelay();
+        try
+        {
+            RunIdlingTick(sender);
+        }
+        finally
+        {
+            // Returns as soon as input or any message (UI Automation, COM, window messages) is queued.
+            MsgWaitForMultipleObjectsEx(0, null, IdleWaitMilliseconds, QsAllInput, MwmoInputAvailable);
+        }
+    }
+
+    private void RunIdlingTick(object? sender)
+    {
         if (sender is UIApplication currentUiapp)
         {
             _uiapp = currentUiapp;
         }
         var uiapp = _uiapp;
-        WriteHeartbeat(sender, uiapp);
+        var now = DateTime.UtcNow;
+        var statusDue = (now - _lastStatusWriteUtc).TotalMilliseconds >= StatusWriteIntervalMilliseconds;
+        if (statusDue)
+        {
+            _lastStatusWriteUtc = now;
+            TryWriteStatus(() => WriteHeartbeat(sender, uiapp, retry: false));
+        }
         if (uiapp == null)
         {
-            AppendResult(new Dictionary<string, object?>
+            if (statusDue)
             {
-                ["id"] = "idling-no-uiapp-" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                ["success"] = false,
-                ["error"] = "Revit Idling event did not provide a UIApplication and no fallback UIApplication is available.",
-                ["sender_type"] = sender?.GetType().FullName,
-                ["timestamp"] = DateTimeOffset.UtcNow.ToString("O")
-            });
+                AppendResult(new Dictionary<string, object?>
+                {
+                    ["id"] = "idling-no-uiapp-" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    ["success"] = false,
+                    ["error"] = "Revit Idling event did not provide a UIApplication and no fallback UIApplication is available.",
+                    ["sender_type"] = sender?.GetType().FullName,
+                    ["timestamp"] = DateTimeOffset.UtcNow.ToString("O")
+                });
+            }
             return;
         }
 
         try
         {
-            Directory.CreateDirectory(BridgeDir);
-            WriteActiveDocument(uiapp);
-            ProcessQueuedCommands(uiapp);
+            if (statusDue)
+            {
+                Directory.CreateDirectory(BridgeDir);
+                TryWriteStatus(() => WriteActiveDocument(uiapp, retry: false));
+            }
+            if (CommandQueueChanged())
+            {
+                ProcessQueuedCommands(uiapp);
+            }
         }
         catch (Exception ex)
         {
+            // Re-read the queue after one interval: a line may have been mid-append when this read failed.
+            _queueLength = -1;
+            _queueRetryAfterUtc = DateTime.UtcNow.AddMilliseconds(StatusWriteIntervalMilliseconds);
             AppendResult(new Dictionary<string, object?>
             {
                 ["id"] = "idling-error-" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
@@ -107,6 +155,43 @@ public class HermesRevitOperatorApp : IExternalApplication
                 ["sender_type"] = sender?.GetType().FullName,
                 ["timestamp"] = DateTimeOffset.UtcNow.ToString("O")
             });
+        }
+    }
+
+    private bool CommandQueueChanged()
+    {
+        if (DateTime.UtcNow < _queueRetryAfterUtc)
+        {
+            return false;
+        }
+        var queue = new FileInfo(CommandQueuePath);
+        if (!queue.Exists)
+        {
+            _queueLength = -1;
+            return false;
+        }
+        if (queue.Length == _queueLength && queue.LastWriteTimeUtc == _queueWriteUtc)
+        {
+            return false;
+        }
+        _queueLength = queue.Length;
+        _queueWriteUtc = queue.LastWriteTimeUtc;
+        return true;
+    }
+
+    // Status files are best effort: when another Revit holds the shared file, skip this interval rather than
+    // sleep on the UI thread.
+    private static void TryWriteStatus(Action write)
+    {
+        try
+        {
+            write();
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
         }
     }
 
@@ -405,7 +490,7 @@ public class HermesRevitOperatorApp : IExternalApplication
         };
     }
 
-    private void WriteActiveDocument(UIApplication uiapp)
+    private void WriteActiveDocument(UIApplication uiapp, bool retry = true)
     {
         var app = uiapp.Application;
         var doc = uiapp.ActiveUIDocument?.Document;
@@ -421,7 +506,7 @@ public class HermesRevitOperatorApp : IExternalApplication
         {
             payload["document"] = DocumentInfo(doc, app);
         }
-        WriteJsonAtomic(ActiveDocumentPath, payload);
+        WriteJsonAtomic(ActiveDocumentPath, payload, retry);
     }
 
     private void WriteMetadata(UIApplication uiapp)
@@ -697,7 +782,7 @@ public class HermesRevitOperatorApp : IExternalApplication
         });
     }
 
-    private void WriteHeartbeat(object? sender, UIApplication? uiapp)
+    private void WriteHeartbeat(object? sender, UIApplication? uiapp, bool retry = true)
     {
         Directory.CreateDirectory(BridgeDir);
         WriteJsonAtomic(HeartbeatPath, new Dictionary<string, object?>
@@ -708,7 +793,7 @@ public class HermesRevitOperatorApp : IExternalApplication
             ["has_ui_application"] = uiapp != null,
             ["has_active_document"] = uiapp?.ActiveUIDocument?.Document != null,
             ["addin"] = AddinInfo()
-        });
+        }, retry);
     }
 
     private Dictionary<string, object?> AddinInfo()
@@ -730,6 +815,8 @@ public class HermesRevitOperatorApp : IExternalApplication
             ["target_framework"] = TargetFrameworkMoniker,
             ["supports_continuous_idling"] = true,
             ["uses_idling_set_raise_without_delay"] = true,
+            ["status_write_interval_ms"] = StatusWriteIntervalMilliseconds,
+            ["idle_message_wait_ms"] = IdleWaitMilliseconds,
             ["loaded_at_utc"] = _loadedAtUtc.ToString("O"),
             ["session_id"] = _sessionId,
             ["assembly_name"] = assemblyName.Name,
@@ -749,7 +836,7 @@ public class HermesRevitOperatorApp : IExternalApplication
         };
     }
 
-    private static void WriteJsonAtomic(string path, object payload)
+    private static void WriteJsonAtomic(string path, object payload, bool retry = true)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path) ?? ".");
         var temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
@@ -757,10 +844,10 @@ public class HermesRevitOperatorApp : IExternalApplication
         {
             WriteIndented = true
         });
-        WriteAllTextShared(temp, json);
+        WriteAllTextShared(temp, json, retry);
         try
         {
-            RetryFileOperation(() =>
+            RunFileOperation(() =>
             {
                 if (File.Exists(path))
                 {
@@ -770,7 +857,7 @@ public class HermesRevitOperatorApp : IExternalApplication
                 {
                     File.Move(temp, path);
                 }
-            });
+            }, retry);
         }
         finally
         {
@@ -778,9 +865,9 @@ public class HermesRevitOperatorApp : IExternalApplication
         }
     }
 
-    private static void WriteAllTextShared(string path, string text)
+    private static void WriteAllTextShared(string path, string text, bool retry = true)
     {
-        RetryFileOperation(() =>
+        RunFileOperation(() =>
         {
             using var stream = new FileStream(
                 path,
@@ -789,7 +876,19 @@ public class HermesRevitOperatorApp : IExternalApplication
                 FileShare.ReadWrite | FileShare.Delete);
             using var writer = new StreamWriter(stream);
             writer.Write(text);
-        });
+        }, retry);
+    }
+
+    private static void RunFileOperation(Action action, bool retry)
+    {
+        if (retry)
+        {
+            RetryFileOperation(action);
+        }
+        else
+        {
+            action();
+        }
     }
 
     private static void AppendLineWithRetry(string path, string line)

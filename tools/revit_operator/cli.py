@@ -364,7 +364,8 @@ def build_parser() -> argparse.ArgumentParser:
         "transport-safety-matrix",
         help="Validate agent-facing transport redaction and fail-closed wrapper gates.",
     )
-    sub.add_parser("status", help="Summarize Revit process/window/dialog/document state.")
+    status_parser = sub.add_parser("status", help="Summarize Revit process/window/dialog/document state.")
+    _add_bridge_target_args(status_parser)
     sub.add_parser("list-processes", help="List running Revit processes.")
     sub.add_parser("list-revit-installs", help="List installed Revit executables.")
 
@@ -647,6 +648,7 @@ def build_parser() -> argparse.ArgumentParser:
     wait_ready.add_argument("--expected-view-type", default="")
     wait_ready.add_argument("--no-require-bridge", action="store_true")
     wait_ready.add_argument("--no-stop-on-modal", action="store_true")
+    _add_bridge_target_args(wait_ready)
 
     metadata = sub.add_parser("export-metadata", help="Export read-only metadata to sandbox.")
     metadata.add_argument("--output", help="Output path under the selected sandbox.")
@@ -662,8 +664,13 @@ def build_parser() -> argparse.ArgumentParser:
     bridge_results.add_argument("--command-id", help="Filter to one command id.")
     bridge_results.add_argument("--limit", type=int, default=20, help="Maximum recent results to return.")
 
-    sub.add_parser("bridge-status", help="Read add-in status and heartbeat bridge metadata.")
-    sub.add_parser("verify-bridge-build", help="Verify the loaded add-in reports the current bridge build stamp.")
+    bridge_status = sub.add_parser("bridge-status", help="Read add-in status and heartbeat bridge metadata.")
+    _add_bridge_target_args(bridge_status)
+    verify_bridge_build = sub.add_parser(
+        "verify-bridge-build",
+        help="Verify the loaded add-in reports the current bridge build stamp.",
+    )
+    _add_bridge_target_args(verify_bridge_build)
     bridge_readiness = sub.add_parser(
         "bridge-readiness",
         help="Read-only audit of add-in manifest, DLL, and loaded bridge readiness.",
@@ -671,6 +678,7 @@ def build_parser() -> argparse.ArgumentParser:
     bridge_readiness.add_argument("--revit-version", default="2025")
     bridge_readiness.add_argument("--addins-root")
     bridge_readiness.add_argument("--assembly")
+    _add_bridge_target_args(bridge_readiness)
     bridge_restart = sub.add_parser(
         "bridge-restart-validation-plan",
         help="Write a read-only human restart/reload handoff and post-restart bridge validation checklist.",
@@ -682,6 +690,7 @@ def build_parser() -> argparse.ArgumentParser:
     bridge_restart.add_argument("--expected-path-contains", default="")
     bridge_restart.add_argument("--expected-view-name", default="")
     bridge_restart.add_argument("--expected-view-type", default="")
+    _add_bridge_target_args(bridge_restart)
     bridge_post_restart = sub.add_parser(
         "bridge-post-restart-validation",
         help="Run the read-only post-human-restart bridge validation checklist.",
@@ -695,6 +704,7 @@ def build_parser() -> argparse.ArgumentParser:
     bridge_post_restart.add_argument("--expected-view-type", default="")
     bridge_post_restart.add_argument("--timeout", type=float, default=120.0)
     bridge_post_restart.add_argument("--poll", type=float, default=2.0)
+    _add_bridge_target_args(bridge_post_restart)
 
     wait_bridge = sub.add_parser("wait-bridge-result", help="Wait for one add-in bridge command result.")
     wait_bridge.add_argument("--command-id", required=True)
@@ -1241,6 +1251,15 @@ def _add_project_browser_visual_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_bridge_target_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--hwnd",
+        type=int,
+        help="Read the per-process bridge status of the Revit that owns this window.",
+    )
+    parser.add_argument("--pid", type=int, help="Read the per-process bridge status of this Revit process.")
+
+
 def _add_context_menu_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--name", required=True)
     parser.add_argument("--target-name", default="")
@@ -1389,7 +1408,9 @@ def dispatch(args: argparse.Namespace) -> dict:
     sandbox = _resolve_sandbox(args)
     journal = TaskJournal(sandbox, args.task_id)
     observer = RevitWindowObserver()
-    bridge = RevitBridgeClient(sandbox)
+    # Commands that target a window read that Revit's own status files instead of the shared, last-writer-wins ones.
+    target = {"target_hwnd": getattr(args, "hwnd", None), "target_pid": getattr(args, "pid", None)}
+    bridge = RevitBridgeClient(sandbox, **{key: value for key, value in target.items() if value})
 
     command = args.command
     if command == "serve":

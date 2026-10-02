@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
+import sys
 import time
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .addin_installer import addin_source_dir, default_addins_root, default_assembly_path
@@ -20,6 +23,10 @@ from .version_support import (
 
 EXPECTED_BRIDGE_PROTOCOL_VERSION = "0.2"
 EXPECTED_SOURCE_CAPABILITY_STAMP = "continuous-idling-status-file-retry-v2"
+# A per-process status file belongs to the live process with that id only if their start times agree.
+PROCESS_START_TOLERANCE_SECONDS = 2.0
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_FILETIME_EPOCH = datetime(1601, 1, 1, tzinfo=timezone.utc)
 
 
 class RevitBridgeClient:
@@ -30,7 +37,7 @@ class RevitBridgeClient:
     satisfy without changing the CLI contract.
     """
 
-    def __init__(self, sandbox: Path):
+    def __init__(self, sandbox: Path, *, target_hwnd: int | None = None, target_pid: int | None = None):
         self.sandbox = sandbox.resolve()
         self.bridge_dir = self.sandbox / "bridge"
         self.addin_status_path = self.bridge_dir / "addin_status.json"
@@ -38,19 +45,65 @@ class RevitBridgeClient:
         self.active_document_path = self.bridge_dir / "active_document.json"
         self.metadata_snapshot_path = self.bridge_dir / "metadata_snapshot.json"
         self.command_results_path = self.bridge_dir / "command_results.jsonl"
+        # The shared status files are last-writer-wins across tandem Revit sessions. The add-in also writes
+        # <name>.<pid>.json per process, and reads prefer those of the process that owns the target window.
+        self.target_hwnd = target_hwnd
+        self.target_pid = target_pid or process_id_for_hwnd(target_hwnd)
+
+    def process_status_paths(self, pid: int) -> dict[str, Path]:
+        return {
+            "addin_status": self.bridge_dir / f"addin_status.{pid}.json",
+            "heartbeat": self.bridge_dir / f"addin_heartbeat.{pid}.json",
+            "active_document": self.bridge_dir / f"active_document.{pid}.json",
+        }
 
     def bridge_status(self) -> dict:
-        status = self._read_json_file(self.addin_status_path)
-        heartbeat = self._read_json_file(self.heartbeat_path)
+        return self._bridge_status(self._status_selection())
+
+    def _status_selection(self) -> dict:
+        """Pick the target process's own status files, falling back to the shared files."""
+        shared = {
+            "addin_status": self.addin_status_path,
+            "heartbeat": self.heartbeat_path,
+            "active_document": self.active_document_path,
+        }
+        target = {"hwnd": self.target_hwnd, "pid": self.target_pid}
+        if not self.target_pid:
+            return {"source": "shared", "paths": shared, "payloads": {}, "target": target}
+        paths = self.process_status_paths(self.target_pid)
+        payloads = {key: self._read_json_file(paths[key]) for key in ("addin_status", "heartbeat")}
+        if any(payload.get("available") is True for payload in payloads.values()):
+            reason = _process_identity_mismatch(self.target_pid, payloads)
+            if reason is None:
+                return {"source": "process", "paths": paths, "payloads": payloads, "target": target}
+        else:
+            reason = (
+                f"Revit process {self.target_pid} wrote no per-process status files: it runs an older add-in "
+                "build or none, so the shared files may describe another session."
+            )
+        return {
+            "source": "shared_fallback",
+            "paths": shared,
+            "payloads": {},
+            "target": target,
+            "fallback_reason": reason,
+        }
+
+    def _bridge_status(self, selection: dict) -> dict:
+        paths = selection["paths"]
+        status = selection["payloads"].get("addin_status") or self._read_json_file(paths["addin_status"])
+        heartbeat = selection["payloads"].get("heartbeat") or self._read_json_file(paths["heartbeat"])
         connected = status.get("available") is True or heartbeat.get("available") is True
         result = {
             "available": connected,
             "status": "connected" if connected else "stub",
             "bridge_dir": str(self.bridge_dir),
-            "addin_status_path": str(self.addin_status_path),
-            "heartbeat_path": str(self.heartbeat_path),
+            "addin_status_path": str(paths["addin_status"]),
+            "heartbeat_path": str(paths["heartbeat"]),
             "addin_status": status,
             "heartbeat": heartbeat,
+            **_status_source_fields(selection),
+            "writer_process_id": _payload_process_id(status) or _payload_process_id(heartbeat),
         }
         if not connected:
             result["note"] = "No add-in status or heartbeat payload is present yet."
@@ -114,6 +167,30 @@ class RevitBridgeClient:
                 "Loaded add-in reports IdlingEventArgs.SetRaiseWithoutDelay usage.",
             ),
         ]
+        expected = {
+            "bridge_protocol_version": expected_protocol_version,
+            "source_capability_stamp": expected_source_capability_stamp,
+            "supports_continuous_idling": True,
+            "uses_idling_set_raise_without_delay": True,
+        }
+        if self.target_pid:
+            # The shared files may come from another tandem session, so a targeted check only trusts the
+            # target process's own files.
+            from_target = status.get("status_source") == "process"
+            expected["status_source"] = "process"
+            checks.append(
+                {
+                    "name": "status_from_target_process",
+                    "expected": True,
+                    "actual": from_target,
+                    "passed": from_target,
+                    "reason": (
+                        f"Status comes from Revit process {self.target_pid}'s own status files."
+                        if from_target
+                        else status.get("fallback_reason") or "Status does not come from the target process."
+                    ),
+                }
+            )
         missing = [check for check in checks if not check["passed"]]
         observed = {
             "addin": addin,
@@ -124,15 +201,12 @@ class RevitBridgeClient:
             "success": not missing,
             "read_only": True,
             "status": "current" if not missing else "stale_or_unverified",
-            "expected": {
-                "bridge_protocol_version": expected_protocol_version,
-                "source_capability_stamp": expected_source_capability_stamp,
-                "supports_continuous_idling": True,
-                "uses_idling_set_raise_without_delay": True,
-            },
+            "expected": expected,
             "observed": observed,
             "loaded_addin": addin,
             "checks": checks,
+            "status_source": status.get("status_source"),
+            "target": status.get("target"),
             "bridge_status": status,
             "recommendation": "loaded_build_verified" if not missing else (
                 "Rebuild/sign/install the add-in if needed, then restart or reload Revit so "
@@ -249,13 +323,29 @@ class RevitBridgeClient:
         }
 
     def active_document_status(self) -> dict:
-        active_document_payload = self._read_json_file(self.active_document_path)
+        selection = self._status_selection()
+        active_document_path = selection["paths"]["active_document"]
+        active_document_payload = self._read_json_file(active_document_path)
         if active_document_payload.get("available") is True:
+            writer_pid = _payload_process_id(active_document_payload)
+            if selection["source"] == "shared_fallback" and writer_pid not in (None, self.target_pid):
+                return {
+                    "available": False,
+                    "status": "other_process_document",
+                    "error": (
+                        f"The shared active document was written by Revit process {writer_pid}, "
+                        f"not target process {self.target_pid}."
+                    ),
+                    "writer_process_id": writer_pid,
+                    "bridge_path": str(active_document_path),
+                    **_status_source_fields(selection),
+                }
             return {
                 "available": True,
                 "status": "connected",
                 "document": active_document_payload["payload"],
-                "bridge": self.bridge_status(),
+                "bridge": self._bridge_status(selection),
+                **_status_source_fields(selection),
             }
         if active_document_payload.get("status") != "missing":
             return {
@@ -263,14 +353,16 @@ class RevitBridgeClient:
                 "status": active_document_payload.get("status", "invalid_bridge_payload"),
                 "error": active_document_payload.get("error"),
                 "error_type": active_document_payload.get("error_type"),
-                "bridge_path": str(self.active_document_path),
+                "bridge_path": str(active_document_path),
+                **_status_source_fields(selection),
             }
 
         return {
             "available": False,
             "status": "stub",
-            "bridge_path": str(self.active_document_path),
-            "bridge": self.bridge_status(),
+            "bridge_path": str(active_document_path),
+            "bridge": self._bridge_status(selection),
+            **_status_source_fields(selection),
             "expected_contract": {
                 "document_title": "string",
                 "document_path": "string",
@@ -471,6 +563,97 @@ def _loaded_addin_payload(status: dict) -> dict:
         if isinstance(addin, dict):
             return addin
     return {}
+
+
+def process_id_for_hwnd(hwnd: int | None) -> int | None:
+    """Return the id of the process that owns a window, or None off Windows or for a dead window."""
+    if not hwnd or sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    pid = wintypes.DWORD(0)
+    if not user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid)):
+        return None
+    return int(pid.value) or None
+
+
+def _process_start_utc(pid: int) -> datetime | None:
+    """Return when the live process with this id started, or None if it cannot be inspected."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, *([ctypes.POINTER(wintypes.FILETIME)] * 4)]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not kernel32.GetProcessTimes(handle, *(ctypes.byref(item) for item in times)):
+            return None
+    finally:
+        kernel32.CloseHandle(handle)
+    created = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+    return _FILETIME_EPOCH + timedelta(microseconds=created // 10)
+
+
+def _parse_utc(value) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    # .NET writes seven fractional digits; fromisoformat keeps at most six.
+    text = re.sub(r"(\.\d{6})\d+", r"\1", value.strip()).replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _payload_addin(payload: dict) -> dict:
+    data = payload.get("payload") if isinstance(payload, dict) else None
+    addin = data.get("addin") if isinstance(data, dict) else None
+    return addin if isinstance(addin, dict) else {}
+
+
+def _payload_process_id(payload: dict):
+    return _payload_addin(payload).get("process_id")
+
+
+def _process_identity_mismatch(pid: int, payloads: dict) -> str | None:
+    """Explain why per-process status files do not belong to the live process with this id."""
+    for payload in payloads.values():
+        addin = _payload_addin(payload)
+        if not addin:
+            continue
+        reported_pid = addin.get("process_id")
+        if reported_pid is not None and reported_pid != pid:
+            return f"The per-process status files for process {pid} name process {reported_pid}."
+        reported_start = _parse_utc(addin.get("process_start_utc"))
+        live_start = _process_start_utc(pid) if reported_start else None
+        if live_start and abs((reported_start - live_start).total_seconds()) > PROCESS_START_TOLERANCE_SECONDS:
+            return (
+                f"The per-process status files for process {pid} were written by an earlier process "
+                f"(started {reported_start.isoformat()}); the id now belongs to one started {live_start.isoformat()}."
+            )
+        return None
+    return None
+
+
+def _status_source_fields(selection: dict) -> dict:
+    fields = {"status_source": selection["source"], "target": selection["target"]}
+    if selection.get("fallback_reason"):
+        fields["fallback_reason"] = selection["fallback_reason"]
+    return fields
 
 
 def _check_value(name: str, expected, actual, passed_reason: str) -> dict:

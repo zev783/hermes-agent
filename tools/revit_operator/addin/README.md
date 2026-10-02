@@ -11,6 +11,23 @@ It is intentionally small:
 - writes command results to `bridge/command_results.jsonl`
 - exports read-only metadata to `bridge/metadata_snapshot.json`
 
+Every Revit that loads the add-in shares one bridge folder, so:
+
+- Status files are written per process as well: `addin_status.<pid>.json`,
+  `addin_heartbeat.<pid>.json` and `active_document.<pid>.json`. The shared
+  `addin_status.json`, `addin_heartbeat.json` and `active_document.json` are
+  last-writer-wins across tandem sessions and stay only for older readers.
+  Give bridge commands `--hwnd` (or `--pid`) to read the session that owns a
+  window.
+- Commands queued more than 15 minutes before the Revit process started are
+  skipped, not replayed. One `skipped_stale_commands` result lists them. A
+  command queued just before launching Revit still runs.
+- Status writes rename a per-process temp file over the target, at most once a
+  second and without sleeping on the UI thread. A thread-pool timer deletes
+  leftover temp files (`*~RF*.TMP` from older builds' `File.Replace`,
+  `*.json.*.tmp`) and the per-process files of exited Revit processes, once
+  they are 10 minutes old.
+
 Supported Revit versions and add-in targets:
 
 | Revit | Target framework |

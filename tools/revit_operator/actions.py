@@ -28,7 +28,7 @@ class SafeActionExecutor:
         self.journal = journal
 
     def run(self, request: ActionRequest) -> dict:
-        before = self._status()
+        before = self._status(request.payload)
         decision = classify_action(request.action, request.payload)
         allowed, auth_reason = authorize(decision, request.approval_token)
 
@@ -84,7 +84,7 @@ class SafeActionExecutor:
         except Exception as exc:
             execution = {"success": False, "error": f"{type(exc).__name__}: {exc}"}
 
-        after = self._status()
+        after = self._status(request.payload)
         verification = self._verify_expected_state(request.payload, after)
         executed = bool(execution.get("success")) and verification["success"]
         result.update(
@@ -99,7 +99,7 @@ class SafeActionExecutor:
         self._log(request, result, before=before, after=after)
         return result
 
-    def _status(self) -> dict:
+    def _status(self, payload: dict | None = None) -> dict:
         status = self.observer.status()
         if not isinstance(status, dict):
             return {"state": "unknown", "raw_status": status}
@@ -117,9 +117,11 @@ class SafeActionExecutor:
                 }
         if "active_document" in status:
             return status
+        # The document of the Revit that owns the action's target window, not whichever session wrote last.
+        bridge = RevitBridgeClient(self.journal.sandbox, target_hwnd=_int_or_none((payload or {}).get("hwnd")))
         return {
             **status,
-            "active_document": RevitBridgeClient(self.journal.sandbox).active_document_status(),
+            "active_document": bridge.active_document_status(),
         }
 
     def _focus(self, payload: dict) -> dict:

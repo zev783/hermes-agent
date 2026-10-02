@@ -489,9 +489,31 @@ def test_revit_addin_bridge_writes_are_retrying_and_reader_tolerant():
 
     assert "RetryFileOperation" in source
     assert "FileShare.ReadWrite | FileShare.Delete" in source
-    assert 'Guid.NewGuid().ToString("N") + ".tmp"' in source
-    assert "File.Replace(temp, path, null, true)" in source
     assert "AppendLineWithRetry(CommandResultsPath" in source
+    # File.Replace left "<name>~RF<hex>.TMP" backups whenever another process held the target, and
+    # per-write GUID temp names piled up whenever a write failed.
+    assert "File.Replace(" not in source
+    assert 'path + "." + ProcessId + ".tmp"' in source
+
+
+def test_revit_addin_process_status_file_names_match_bridge_client():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "tools"
+        / "revit_operator"
+        / "addin"
+        / "HermesRevitOperatorApp.cs"
+    ).read_text(encoding="utf-8")
+    stems_line = next(line for line in source.splitlines() if "ProcessStatusFileStems =" in line)
+    stems = stems_line.split("{", 1)[1].split("}", 1)[0].replace('"', "").replace(" ", "").split(",")
+
+    paths = RevitBridgeClient(Path("sandbox")).process_status_paths(42)
+
+    assert sorted(path.name for path in paths.values()) == sorted(f"{stem}.42.json" for stem in stems)
+    assert 'Path.GetFileNameWithoutExtension(sharedPath) + "." + ProcessId + ".json"' in source
+    # The client compares these to reject files that an earlier process with a reused PID left behind.
+    assert '["process_id"] = ProcessId' in source
+    assert '["process_start_utc"] = ProcessStartUtc' in source
 
 
 def test_transmitted_model_dialog_matches_known_rule():
@@ -20573,6 +20595,140 @@ def test_verify_bridge_build_flags_stale_loaded_payload(tmp_path):
     assert "supports_continuous_idling" in failed
 
 
+def _write_bridge_payload(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _current_bridge_addin(pid: int, *, started: str = "2026-10-02T12:00:00.1234567Z") -> dict:
+    return {
+        "bridge_protocol_version": "0.2",
+        "source_capability_stamp": "continuous-idling-status-file-retry-v2",
+        "supports_continuous_idling": True,
+        "uses_idling_set_raise_without_delay": True,
+        "process_id": pid,
+        "process_start_utc": started,
+        "session_id": f"session-{pid}",
+    }
+
+
+def test_bridge_status_prefers_target_process_files_over_shared_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        bridge_module,
+        "_process_start_utc",
+        lambda pid: datetime(2026, 10, 2, 12, 0, 0, 123456, tzinfo=timezone.utc),
+    )
+    bridge = RevitBridgeClient(tmp_path, target_pid=222)
+    # Another tandem session wrote the shared files last.
+    _write_bridge_payload(bridge.addin_status_path, {"status": "started", "addin": _current_bridge_addin(111)})
+    _write_bridge_payload(
+        bridge.active_document_path,
+        {"available": True, "document": {"title": "Other Session"}, "addin": _current_bridge_addin(111)},
+    )
+    paths = bridge.process_status_paths(222)
+    _write_bridge_payload(paths["heartbeat"], {"status": "idling", "addin": _current_bridge_addin(222)})
+    _write_bridge_payload(
+        paths["active_document"],
+        {"available": True, "document": {"title": "Target Session"}, "addin": _current_bridge_addin(222)},
+    )
+
+    status = bridge.bridge_status()
+    verified = bridge.verify_loaded_build()
+    document = bridge.active_document_status()
+
+    assert status["status_source"] == "process"
+    assert status["heartbeat_path"] == str(paths["heartbeat"])
+    assert status["writer_process_id"] == 222
+    assert verified["success"] is True
+    assert {check["name"]: check["passed"] for check in verified["checks"]}["status_from_target_process"] is True
+    assert document["status_source"] == "process"
+    assert document["document"]["document"]["title"] == "Target Session"
+
+
+def test_bridge_status_without_target_keeps_reading_shared_files(tmp_path):
+    bridge = RevitBridgeClient(tmp_path)
+    _write_bridge_payload(bridge.addin_status_path, {"status": "started", "addin": _current_bridge_addin(111)})
+    _write_bridge_payload(
+        bridge.process_status_paths(222)["addin_status"],
+        {"status": "started", "addin": _current_bridge_addin(222)},
+    )
+
+    status = bridge.bridge_status()
+    verified = bridge.verify_loaded_build()
+
+    assert status["status_source"] == "shared"
+    assert status["writer_process_id"] == 111
+    assert verified["success"] is True
+    assert "status_from_target_process" not in {check["name"] for check in verified["checks"]}
+
+
+def test_verify_bridge_build_rejects_shared_status_for_target_without_process_files(tmp_path):
+    bridge = RevitBridgeClient(tmp_path, target_pid=333)
+    _write_bridge_payload(bridge.addin_status_path, {"status": "started", "addin": _current_bridge_addin(111)})
+    _write_bridge_payload(
+        bridge.active_document_path,
+        {"available": True, "document": {"title": "Other Session"}, "addin": _current_bridge_addin(111)},
+    )
+
+    verified = bridge.verify_loaded_build()
+    document = bridge.active_document_status()
+
+    failed = {check["name"]: check for check in verified["checks"] if not check["passed"]}
+    assert verified["status"] == "stale_or_unverified"
+    assert verified["status_source"] == "shared_fallback"
+    assert set(failed) == {"status_from_target_process"}
+    assert "older add-in build" in failed["status_from_target_process"]["reason"]
+    assert document["available"] is False
+    assert document["status"] == "other_process_document"
+    assert document["writer_process_id"] == 111
+
+
+def test_bridge_status_ignores_process_files_left_by_earlier_process_with_same_pid(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        bridge_module,
+        "_process_start_utc",
+        lambda pid: datetime(2026, 10, 2, 15, 0, tzinfo=timezone.utc),
+    )
+    bridge = RevitBridgeClient(tmp_path, target_pid=222)
+    _write_bridge_payload(
+        bridge.process_status_paths(222)["heartbeat"],
+        {"status": "idling", "addin": _current_bridge_addin(222, started="2026-09-30T08:00:00.1234567Z")},
+    )
+
+    status = bridge.bridge_status()
+
+    assert status["status_source"] == "shared_fallback"
+    assert "earlier process" in status["fallback_reason"]
+    assert status["heartbeat_path"] == str(bridge.heartbeat_path)
+
+
+def test_cli_verify_bridge_build_reads_target_window_process_files(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(bridge_module, "process_id_for_hwnd", lambda hwnd: {4242: 222}.get(hwnd))
+    monkeypatch.setattr(bridge_module, "_process_start_utc", lambda pid: None)
+    bridge_dir = tmp_path / "bridge"
+    _write_bridge_payload(bridge_dir / "addin_status.json", {"status": "started", "addin": {"session_id": "old"}})
+    _write_bridge_payload(bridge_dir / "addin_status.222.json", {"status": "started", "addin": _current_bridge_addin(222)})
+
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            "verify-bridge-build-target-test",
+            "verify-bridge-build",
+            "--hwnd",
+            "4242",
+        ]
+    )
+
+    assert code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "current"
+    assert output["status_source"] == "process"
+    assert output["target"] == {"hwnd": 4242, "pid": 222}
+
+
 def test_bridge_readiness_requires_restart_when_installed_but_loaded_stale(tmp_path):
     bridge = RevitBridgeClient(tmp_path)
     bridge.bridge_dir.mkdir()
@@ -22145,6 +22301,33 @@ def test_safe_action_executor_records_bridge_active_document_context(tmp_path):
     record = json.loads(journal.journal_path.read_text(encoding="utf-8").splitlines()[-1])
     before = record["observed_ui_state_before_action"]
     assert before["active_document"]["document"]["document"]["title"] == "Bridge Model"
+
+
+def test_safe_action_executor_records_target_window_process_document(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge_module, "process_id_for_hwnd", lambda hwnd: {9001: 222}.get(hwnd))
+    monkeypatch.setattr(bridge_module, "_process_start_utc", lambda pid: None)
+    bridge_dir = tmp_path / "bridge"
+    _write_bridge_payload(bridge_dir / "active_document.json", {"available": True, "document": {"title": "Other"}})
+    _write_bridge_payload(bridge_dir / "addin_heartbeat.222.json", {"status": "idling", "addin": _current_bridge_addin(222)})
+    _write_bridge_payload(
+        bridge_dir / "active_document.222.json",
+        {"available": True, "document": {"title": "Target"}, "addin": _current_bridge_addin(222)},
+    )
+
+    class FakeObserver:
+        supported = False
+
+        def status(self):
+            return {"state": "idle", "active_dialogs": []}
+
+    journal = TaskJournal(tmp_path, "action-target-context-test")
+    result = SafeActionExecutor(FakeObserver(), journal).run(
+        ActionRequest(action="press-key", payload={"key": "Escape", "hwnd": 9001}, dry_run=True)
+    )
+
+    document = result["before"]["active_document"]
+    assert document["status_source"] == "process"
+    assert document["document"]["document"]["title"] == "Target"
 
 
 def test_replay_workflow_execute_queues_request_operation_with_fresh_token(tmp_path):

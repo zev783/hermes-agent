@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -59,23 +60,89 @@ public class HermesRevitOperatorApp : IExternalApplication
     private DateTime _queueWriteUtc = DateTime.MinValue;
     private DateTime _queueRetryAfterUtc = DateTime.MinValue;
 
+    // The shared status files are last-writer-wins across tandem Revit sessions, so each process also writes
+    // addin_status.<pid>.json, addin_heartbeat.<pid>.json and active_document.<pid>.json. Hermes reads the files of
+    // the process that owns its target window; the shared files stay for older readers.
+    private static readonly int ProcessId;
+    private static readonly DateTime ProcessStartUtc;
+    private static readonly string[] ProcessStatusFileStems = { "addin_status", "addin_heartbeat", "active_document" };
+
+    // Commands queued this long before the Revit process started belong to an earlier session and are skipped:
+    // every start used to replay the whole queue, month-old metadata exports and view switches included. A command
+    // queued shortly before launch (queue, then open the model) still runs.
+    private static readonly TimeSpan QueueReplayGrace = TimeSpan.FromMinutes(15);
+
+    // A thread-pool timer sweeps the bridge folder for temp files that failed writes left behind and for the
+    // per-process status files of exited Revit processes. Files younger than StaleBridgeFileAge are never touched.
+    private static readonly TimeSpan StaleBridgeFileAge = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan BridgeSweepDelay = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan BridgeSweepInterval = TimeSpan.FromMinutes(15);
+    private static readonly string[] BridgeTempFilePrefixes =
+    {
+        "active_document.", "addin_heartbeat.", "addin_status.", "metadata_snapshot."
+    };
+    private System.Threading.Timer? _sweepTimer;
+    private int _sweepRunning;
+    private long _lastSweepTicksUtc;
+    private int _lastSweepDeletedFiles;
+    private int _sweepDeletedFilesTotal;
+
+    private static readonly JsonSerializerOptions IndentedJson = new() { WriteIndented = true };
+
+    // Read once at load: an in-place redeploy renames the loaded DLL aside, and its path then holds the new build.
+    private static readonly string? LoadedAssemblyLastWriteUtc;
+    private static readonly long? LoadedAssemblyLength;
+
     [DllImport("user32.dll")]
     private static extern uint MsgWaitForMultipleObjectsEx(uint nCount, IntPtr[]? pHandles, uint dwMilliseconds, uint dwWakeMask, uint dwFlags);
+
+    static HermesRevitOperatorApp()
+    {
+        using var process = System.Diagnostics.Process.GetCurrentProcess();
+        ProcessId = process.Id;
+        try
+        {
+            ProcessStartUtc = process.StartTime.ToUniversalTime();
+        }
+        catch (Exception)
+        {
+            ProcessStartUtc = DateTime.UtcNow;
+        }
+        try
+        {
+            var location = typeof(HermesRevitOperatorApp).Assembly.Location;
+            if (!string.IsNullOrWhiteSpace(location) && File.Exists(location))
+            {
+                var file = new FileInfo(location);
+                LoadedAssemblyLastWriteUtc = file.LastWriteTimeUtc.ToString("O");
+                LoadedAssemblyLength = file.Length;
+            }
+        }
+        catch (Exception)
+        {
+        }
+    }
 
     public Result OnStartup(UIControlledApplication application)
     {
         _sandbox = ResolveSandbox();
         Directory.CreateDirectory(BridgeDir);
         application.Idling += OnIdling;
-        WriteBridgeStatus("started", application.ControlledApplication.VersionNumber);
+        TryWriteStatus(() => WriteBridgeStatus("started", application.ControlledApplication.VersionNumber));
+        _sweepTimer = new System.Threading.Timer(_ => SweepBridgeFolder(), null, BridgeSweepDelay, BridgeSweepInterval);
         return Result.Succeeded;
     }
 
     public Result OnShutdown(UIControlledApplication application)
     {
         application.Idling -= OnIdling;
+        _sweepTimer?.Dispose();
+        _sweepTimer = null;
         _uiapp = null;
-        WriteBridgeStatus("stopped", application.ControlledApplication.VersionNumber);
+        TryWriteStatus(() => WriteBridgeStatus("stopped", application.ControlledApplication.VersionNumber));
+        // This process's heartbeat and active document no longer describe a live session.
+        TryDelete(ProcessStatusPath(HeartbeatPath));
+        TryDelete(ProcessStatusPath(ActiveDocumentPath));
         return Result.Succeeded;
     }
 
@@ -85,6 +152,12 @@ public class HermesRevitOperatorApp : IExternalApplication
     private string ActiveDocumentPath => Path.Combine(BridgeDir, "active_document.json");
     private string MetadataPath => Path.Combine(BridgeDir, "metadata_snapshot.json");
     private string HeartbeatPath => Path.Combine(BridgeDir, "addin_heartbeat.json");
+    private string AddinStatusPath => Path.Combine(BridgeDir, "addin_status.json");
+
+    private string ProcessStatusPath(string sharedPath)
+    {
+        return Path.Combine(BridgeDir, Path.GetFileNameWithoutExtension(sharedPath) + "." + ProcessId + ".json");
+    }
 
     private void OnIdling(object? sender, IdlingEventArgs args)
     {
@@ -202,48 +275,118 @@ public class HermesRevitOperatorApp : IExternalApplication
             return;
         }
 
-        foreach (var line in File.ReadLines(CommandQueuePath).ToList())
+        var queueWriteUtc = File.GetLastWriteTimeUtc(CommandQueuePath);
+        var text = ReadAllTextShared(CommandQueuePath);
+        var lines = text.Split('\n');
+        var terminated = text.EndsWith("\n", StringComparison.Ordinal);
+        var staleBeforeUtc = ProcessStartUtc - QueueReplayGrace;
+        var skippedStale = new List<string>();
+        for (var index = 0; index < lines.Length; index++)
         {
-            if (string.IsNullOrWhiteSpace(line))
+            var line = lines[index].Trim();
+            if (line.Length == 0)
             {
                 continue;
             }
+            var lineNumber = index + 1;
 
-            using var doc = JsonDocument.Parse(line);
-            var root = doc.RootElement;
-            var id = GetString(root, "id") ?? Guid.NewGuid().ToString("N");
-            if (_processedCommandIds.Contains(id))
-            {
-                continue;
-            }
-            _processedCommandIds.Add(id);
-
+            JsonDocument doc;
             try
             {
-                var operation = GetString(root, "operation") ?? "";
-                var guards = root.TryGetProperty("guards", out var guardElement) ? guardElement : default;
-                var allowModelWrite = GetBool(guards, "allow_model_write");
-                var allowSync = GetBool(guards, "allow_sync");
-                var opArgs = root.TryGetProperty("args", out var argsElement) ? argsElement : default;
-
-                var result = ExecuteOperation(uiapp, operation, opArgs, allowModelWrite, allowSync);
-                result["id"] = id;
-                result["operation"] = operation;
-                result["timestamp"] = DateTimeOffset.UtcNow.ToString("O");
-                result["addin"] = AddinInfo();
-                AppendResult(result);
+                doc = JsonDocument.Parse(line);
             }
-            catch (Exception ex)
+            catch (JsonException ex)
             {
+                // An unterminated last line may still be mid-append; it is read again once the queue changes.
+                if (index == lines.Length - 1 && !terminated)
+                {
+                    continue;
+                }
+                var invalidId = "invalid-queue-line-" + lineNumber;
+                if (!_processedCommandIds.Add(invalidId))
+                {
+                    continue;
+                }
+                if (queueWriteUtc < staleBeforeUtc)
+                {
+                    skippedStale.Add(invalidId);
+                    continue;
+                }
                 AppendResult(new Dictionary<string, object?>
                 {
-                    ["id"] = id,
+                    ["id"] = invalidId,
                     ["success"] = false,
-                    ["error"] = ex.ToString(),
+                    ["error"] = "Command queue line " + lineNumber + " is not valid JSON: " + ex.Message,
                     ["addin"] = AddinInfo(),
                     ["timestamp"] = DateTimeOffset.UtcNow.ToString("O")
                 });
+                continue;
             }
+
+            using (doc)
+            {
+                var root = doc.RootElement;
+                // The queue is append-only, so a line without an id is keyed by its position.
+                var id = GetString(root, "id") ?? "queue-line-" + lineNumber;
+                if (!_processedCommandIds.Add(id))
+                {
+                    continue;
+                }
+                // Without a timestamp, the queue file's last write bounds how recently the line was appended.
+                var queuedAtUtc = GetUtcTimestamp(root, "timestamp") ?? queueWriteUtc;
+                if (queuedAtUtc < staleBeforeUtc)
+                {
+                    skippedStale.Add(id);
+                    continue;
+                }
+                ExecuteQueuedCommand(uiapp, root, id);
+            }
+        }
+
+        if (skippedStale.Count > 0)
+        {
+            AppendResult(new Dictionary<string, object?>
+            {
+                ["id"] = "stale-queue-skip-" + _sessionId + "-" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                ["success"] = true,
+                ["status"] = "skipped_stale_commands",
+                ["message"] = "Skipped commands queued before this Revit process started; they were not replayed.",
+                ["skipped_count"] = skippedStale.Count,
+                ["skipped_command_ids"] = skippedStale.Take(50).ToList(),
+                ["queued_before_utc"] = staleBeforeUtc.ToString("O"),
+                ["addin"] = AddinInfo(),
+                ["timestamp"] = DateTimeOffset.UtcNow.ToString("O")
+            });
+        }
+    }
+
+    private void ExecuteQueuedCommand(UIApplication uiapp, JsonElement root, string id)
+    {
+        try
+        {
+            var operation = GetString(root, "operation") ?? "";
+            var guards = root.TryGetProperty("guards", out var guardElement) ? guardElement : default;
+            var allowModelWrite = GetBool(guards, "allow_model_write");
+            var allowSync = GetBool(guards, "allow_sync");
+            var opArgs = root.TryGetProperty("args", out var argsElement) ? argsElement : default;
+
+            var result = ExecuteOperation(uiapp, operation, opArgs, allowModelWrite, allowSync);
+            result["id"] = id;
+            result["operation"] = operation;
+            result["timestamp"] = DateTimeOffset.UtcNow.ToString("O");
+            result["addin"] = AddinInfo();
+            AppendResult(result);
+        }
+        catch (Exception ex)
+        {
+            AppendResult(new Dictionary<string, object?>
+            {
+                ["id"] = id,
+                ["success"] = false,
+                ["error"] = ex.ToString(),
+                ["addin"] = AddinInfo(),
+                ["timestamp"] = DateTimeOffset.UtcNow.ToString("O")
+            });
         }
     }
 
@@ -506,7 +649,7 @@ public class HermesRevitOperatorApp : IExternalApplication
         {
             payload["document"] = DocumentInfo(doc, app);
         }
-        WriteJsonAtomic(ActiveDocumentPath, payload, retry);
+        WriteStatusFiles(ActiveDocumentPath, payload, retry);
     }
 
     private void WriteMetadata(UIApplication uiapp)
@@ -739,6 +882,18 @@ public class HermesRevitOperatorApp : IExternalApplication
             : null;
     }
 
+    private static DateTime? GetUtcTimestamp(JsonElement element, string property)
+    {
+        var text = GetString(element, property);
+        return text != null && DateTimeOffset.TryParse(
+            text,
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+            out var value)
+            ? value.UtcDateTime
+            : null;
+    }
+
     private static long? GetLong(JsonElement element, string property)
     {
         if (element.ValueKind != JsonValueKind.Object || !element.TryGetProperty(property, out var value))
@@ -773,37 +928,42 @@ public class HermesRevitOperatorApp : IExternalApplication
     private void WriteBridgeStatus(string status, string version)
     {
         Directory.CreateDirectory(BridgeDir);
-        WriteJsonAtomic(Path.Combine(BridgeDir, "addin_status.json"), new Dictionary<string, object?>
+        WriteStatusFiles(AddinStatusPath, new Dictionary<string, object?>
         {
             ["status"] = status,
             ["revit_version"] = version,
             ["addin"] = AddinInfo(),
             ["timestamp"] = DateTimeOffset.UtcNow.ToString("O")
-        });
+        }, retry: true);
     }
 
     private void WriteHeartbeat(object? sender, UIApplication? uiapp, bool retry = true)
     {
         Directory.CreateDirectory(BridgeDir);
-        WriteJsonAtomic(HeartbeatPath, new Dictionary<string, object?>
+        WriteStatusFiles(HeartbeatPath, new Dictionary<string, object?>
         {
             ["status"] = "idling",
             ["timestamp"] = DateTimeOffset.UtcNow.ToString("O"),
             ["sender_type"] = sender?.GetType().FullName,
             ["has_ui_application"] = uiapp != null,
             ["has_active_document"] = uiapp?.ActiveUIDocument?.Document != null,
+            ["bridge_sweep"] = BridgeSweepInfo(),
             ["addin"] = AddinInfo()
         }, retry);
+    }
+
+    // The per-process file must land, and only this Revit writes it. The shared copy is single-attempt best effort,
+    // so a tandem session holding it never makes this UI thread wait.
+    private void WriteStatusFiles(string sharedPath, object payload, bool retry)
+    {
+        WriteJsonAtomic(ProcessStatusPath(sharedPath), payload, retry);
+        TryWriteStatus(() => WriteJsonAtomic(sharedPath, payload, retry: false));
     }
 
     private Dictionary<string, object?> AddinInfo()
     {
         var assembly = Assembly.GetExecutingAssembly();
         var assemblyName = assembly.GetName();
-        var assemblyPath = assembly.Location;
-        var assemblyFile = string.IsNullOrWhiteSpace(assemblyPath) || !File.Exists(assemblyPath)
-            ? null
-            : new FileInfo(assemblyPath);
 
         return new Dictionary<string, object?>
         {
@@ -817,13 +977,17 @@ public class HermesRevitOperatorApp : IExternalApplication
             ["uses_idling_set_raise_without_delay"] = true,
             ["status_write_interval_ms"] = StatusWriteIntervalMilliseconds,
             ["idle_message_wait_ms"] = IdleWaitMilliseconds,
+            ["process_id"] = ProcessId,
+            ["process_start_utc"] = ProcessStartUtc.ToString("O"),
+            ["writes_process_status_files"] = true,
+            ["stale_queue_grace_seconds"] = (int)QueueReplayGrace.TotalSeconds,
             ["loaded_at_utc"] = _loadedAtUtc.ToString("O"),
             ["session_id"] = _sessionId,
             ["assembly_name"] = assemblyName.Name,
             ["assembly_version"] = assemblyName.Version?.ToString(),
-            ["assembly_path"] = assemblyPath,
-            ["assembly_last_write_utc"] = assemblyFile == null ? null : assemblyFile.LastWriteTimeUtc.ToString("O"),
-            ["assembly_length"] = assemblyFile?.Length,
+            ["assembly_path"] = assembly.Location,
+            ["assembly_last_write_utc"] = LoadedAssemblyLastWriteUtc,
+            ["assembly_length"] = LoadedAssemblyLength,
             ["capabilities"] = new[]
             {
                 "active-document",
@@ -836,34 +1000,156 @@ public class HermesRevitOperatorApp : IExternalApplication
         };
     }
 
+    private Dictionary<string, object?> BridgeSweepInfo()
+    {
+        var ticks = Interlocked.Read(ref _lastSweepTicksUtc);
+        return new Dictionary<string, object?>
+        {
+            ["last_run_utc"] = ticks == 0 ? null : new DateTime(ticks, DateTimeKind.Utc).ToString("O"),
+            ["deleted_files"] = Volatile.Read(ref _lastSweepDeletedFiles),
+            ["deleted_files_total"] = Volatile.Read(ref _sweepDeletedFilesTotal)
+        };
+    }
+
+    // Runs on a thread-pool thread, never on Revit's UI thread, and must not throw.
+    private void SweepBridgeFolder()
+    {
+        if (Interlocked.Exchange(ref _sweepRunning, 1) == 1)
+        {
+            return;
+        }
+        try
+        {
+            var bridge = new DirectoryInfo(BridgeDir);
+            if (!bridge.Exists)
+            {
+                return;
+            }
+            var staleBeforeUtc = DateTime.UtcNow - StaleBridgeFileAge;
+            var deleted = 0;
+            foreach (var file in bridge.EnumerateFiles())
+            {
+                try
+                {
+                    if (file.LastWriteTimeUtc < staleBeforeUtc
+                        && (IsLeftoverTempFile(file.Name) || IsExitedProcessStatusFile(file))
+                        && TryDelete(file.FullName))
+                    {
+                        deleted++;
+                    }
+                }
+                catch (Exception)
+                {
+                }
+            }
+            Volatile.Write(ref _lastSweepDeletedFiles, deleted);
+            Interlocked.Add(ref _sweepDeletedFilesTotal, deleted);
+            Interlocked.Exchange(ref _lastSweepTicksUtc, DateTime.UtcNow.Ticks);
+        }
+        catch (Exception)
+        {
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _sweepRunning, 0);
+        }
+    }
+
+    // "<name>~RF<hex>.TMP" files are File.Replace backups that older builds left when another process held the
+    // target; "<name>.<guid|pid>.tmp" files are temps of writes that failed before their rename.
+    private static bool IsLeftoverTempFile(string name)
+    {
+        return name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase)
+            && BridgeTempFilePrefixes.Any(prefix => name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsExitedProcessStatusFile(FileInfo file)
+    {
+        var pid = ProcessIdFromStatusFileName(file.Name);
+        if (pid == null || pid.Value == ProcessId)
+        {
+            return false;
+        }
+        try
+        {
+            using var process = System.Diagnostics.Process.GetProcessById(pid.Value);
+            // A reused PID belongs to a process that started after the status file was last written.
+            return !string.Equals(process.ProcessName, "Revit", StringComparison.OrdinalIgnoreCase)
+                || process.StartTime.ToUniversalTime() > file.LastWriteTimeUtc;
+        }
+        catch (ArgumentException)
+        {
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    private static int? ProcessIdFromStatusFileName(string name)
+    {
+        const string extension = ".json";
+        foreach (var stem in ProcessStatusFileStems)
+        {
+            var prefix = stem + ".";
+            if (name.Length > prefix.Length + extension.Length
+                && name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+                && name.EndsWith(extension, StringComparison.OrdinalIgnoreCase)
+                && int.TryParse(
+                    name.Substring(prefix.Length, name.Length - prefix.Length - extension.Length),
+                    NumberStyles.None,
+                    CultureInfo.InvariantCulture,
+                    out var pid))
+            {
+                return pid;
+            }
+        }
+        return null;
+    }
+
+    // Writes a temp file and renames it over the target. File.Replace is not used: when another process held the
+    // target it left "<name>~RF<hex>.TMP" backups behind, ~45k of them in the shared bridge folder. The temp name is
+    // per process, so a temp that a failed write leaves is overwritten by the next write instead of accumulating.
     private static void WriteJsonAtomic(string path, object payload, bool retry = true)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path) ?? ".");
-        var temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-        var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions
-        {
-            WriteIndented = true
-        });
+        var temp = path + "." + ProcessId + ".tmp";
+        var json = JsonSerializer.Serialize(payload, IndentedJson);
         WriteAllTextShared(temp, json, retry);
         try
         {
-            RunFileOperation(() =>
-            {
-                if (File.Exists(path))
-                {
-                    File.Replace(temp, path, null, true);
-                }
-                else
-                {
-                    File.Move(temp, path);
-                }
-            }, retry);
+            RunFileOperation(() => MoveReplacing(temp, path), retry);
         }
         finally
         {
             TryDelete(temp);
         }
     }
+
+    private static void MoveReplacing(string source, string destination)
+    {
+#if NET
+        File.Move(source, destination, true);
+#else
+        if (!MoveFileEx(source, destination, MoveFileReplaceExisting))
+        {
+            throw new IOException("Could not replace " + destination + ".", Marshal.GetHRForLastWin32Error());
+        }
+#endif
+    }
+
+#if !NET
+    private const uint MoveFileReplaceExisting = 0x1;
+
+    [DllImport("kernel32.dll", EntryPoint = "MoveFileExW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool MoveFileEx(string existingFileName, string newFileName, uint flags);
+#endif
 
     private static void WriteAllTextShared(string path, string text, bool retry = true)
     {
@@ -877,6 +1163,17 @@ public class HermesRevitOperatorApp : IExternalApplication
             using var writer = new StreamWriter(stream);
             writer.Write(text);
         }, retry);
+    }
+
+    private static string ReadAllTextShared(string path)
+    {
+        using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+        using var reader = new StreamReader(stream);
+        return reader.ReadToEnd();
     }
 
     private static void RunFileOperation(Action action, bool retry)
@@ -927,13 +1224,14 @@ public class HermesRevitOperatorApp : IExternalApplication
         }
     }
 
-    private static void TryDelete(string path)
+    private static bool TryDelete(string path)
     {
         try
         {
             if (File.Exists(path))
             {
                 File.Delete(path);
+                return true;
             }
         }
         catch (IOException)
@@ -942,6 +1240,7 @@ public class HermesRevitOperatorApp : IExternalApplication
         catch (UnauthorizedAccessException)
         {
         }
+        return false;
     }
 
     private static string ResolveSandbox()

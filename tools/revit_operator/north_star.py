@@ -18,6 +18,7 @@ from .bridge import (
 from .journal import TaskJournal, utc_now
 from .recovery import classify_recovery_snapshot_for_north_star
 from .safety import classify_action, validate_output_path
+from .ui_workflows import UI_WORKFLOWS
 
 
 APPROVAL_PREFLIGHT_TTL_SECONDS = 15 * 60
@@ -3892,6 +3893,11 @@ def build_north_star_waiting_state(
     return result
 
 
+def _open_sheet_workflow_step(sheet_number: str) -> dict:
+    """The approval-gated step of project-browser-open-sheet, whose token run-ui-workflow checks at index 3."""
+    return UI_WORKFLOWS["project-browser-open-sheet"].steps[3].render({"sheet_number": sheet_number})
+
+
 def build_north_star_approval_plan(
     journal: TaskJournal,
     *,
@@ -3918,11 +3924,9 @@ def build_north_star_approval_plan(
         "method": "select",
     }
     direct_uia_policy = classify_action("uia-invoke", direct_uia_payload).to_dict()
-    workflow_step_payload = {
-        "operation": "activate-view",
-        "args_json": json.dumps({"sheet_number": default_sheet_number}, separators=(",", ":")),
-    }
-    workflow_step_policy = classify_action("request-operation", workflow_step_payload).to_dict()
+    workflow_step = _open_sheet_workflow_step(default_sheet_number)
+    workflow_step_payload = workflow_step["payload_hint"]
+    workflow_step_policy = workflow_step["policy"]
     context_payload = {
         "context_menu_action": "project-browser-item-menu",
         "control_type": "TreeItem",
@@ -22889,11 +22893,7 @@ def _status_approval_candidates(default_sheet_number: str, prevalidation: dict) 
         "ribbon_action": "view-tab",
     }
     ribbon_policy = classify_action("uia-invoke", ribbon_payload).to_dict()
-    workflow_payload = {
-        "operation": "activate-view",
-        "args_json": json.dumps({"sheet_number": default_sheet_number}, separators=(",", ":")),
-    }
-    workflow_policy = classify_action("request-operation", workflow_payload).to_dict()
+    workflow_policy = _open_sheet_workflow_step(default_sheet_number)["policy"]
     context_payload = {
         "context_menu_action": "project-browser-item-menu",
         "control_type": "TreeItem",

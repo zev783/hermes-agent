@@ -89,7 +89,7 @@ from .north_star import (
     run_north_star_watch,
 )
 from .ocr import ocr_health, ocr_screenshot
-from .operations import OperationRequest, open_model, queue_operation
+from .operations import OperationRequest, open_model, queue_operation, resolve_command_target
 from .palettes import capture_properties_palette_snapshot
 from .project_browser import (
     capture_project_browser_snapshot,
@@ -801,6 +801,7 @@ def build_parser() -> argparse.ArgumentParser:
     ui_plan.add_argument("--target-name")
     ui_plan.add_argument("--target-control-type")
     ui_plan.add_argument("--workflow-name")
+    _add_approval_plan_target_args(ui_plan)
 
     ui_run = sub.add_parser("run-ui-workflow", help="Run one guarded Revit UI workflow recipe with step gates.")
     ui_run.add_argument("--name", required=True)
@@ -818,6 +819,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ui_run.add_argument("--max-steps", type=int)
     ui_run.add_argument("--continue-on-error", action="store_true")
+    _add_approved_execution_target_args(ui_run)
 
     record = sub.add_parser("record-workflow", help="Record a task journal as a reusable workflow template.")
     record.add_argument("--source-task-id", required=True)
@@ -836,6 +838,7 @@ def build_parser() -> argparse.ArgumentParser:
     workflow_approval.add_argument("--name")
     workflow_approval.add_argument("--path")
     workflow_approval.add_argument("--parameters-json", default="{}", help="JSON object of workflow parameter overrides.")
+    _add_approval_plan_target_args(workflow_approval)
 
     replay = sub.add_parser("replay-workflow", help="Replay a recorded workflow with fresh observation and approvals.")
     replay.add_argument("--name")
@@ -850,6 +853,7 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--max-steps", type=int)
     replay.add_argument("--continue-on-modal", action="store_true")
     replay.add_argument("--no-recovery-snapshot", action="store_true")
+    _add_approved_execution_target_args(replay)
 
     open_cmd = sub.add_parser("open-model", help="Launch Revit with a copied local model.")
     _add_action_flags(open_cmd)
@@ -1140,6 +1144,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="{}",
         help="JSON object of workflow/model parameters.",
     )
+    _add_approval_plan_target_args(agent_session_approval)
 
     agent_session_execute = sub.add_parser(
         "agent-session-execute-approved-item",
@@ -1162,6 +1167,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     agent_session_execute.add_argument("--bridge-refresh-timeout", type=float, default=10.0)
+    _add_approved_execution_target_args(
+        agent_session_execute,
+        default=" Defaults to the Revit process the item was approved for.",
+    )
 
     focus = sub.add_parser("focus", help="Focus Revit or a specific Revit window.")
     _add_action_flags(focus)
@@ -1279,6 +1288,31 @@ def _add_operation_target_args(parser: argparse.ArgumentParser) -> None:
             "operations that change a model or the open documents."
         ),
         pid_help="Queue the operation for this Revit process; other Revit sessions skip it.",
+    )
+
+
+def _add_approval_plan_target_args(parser: argparse.ArgumentParser) -> None:
+    _add_bridge_target_args(
+        parser,
+        hwnd_help=(
+            "Plan for the Revit that owns this window. The approval tokens of bridge operations cover that process, "
+            "which then runs them alone. Operations that change a model or the open documents need a target."
+        ),
+        pid_help="Plan for this Revit process. The approval tokens of bridge operations cover it.",
+    )
+
+
+def _add_approved_execution_target_args(parser: argparse.ArgumentParser, *, default: str = "") -> None:
+    _add_bridge_target_args(
+        parser,
+        hwnd_help=(
+            "Queue bridge operations for the Revit that owns this window. Their approval tokens must have been "
+            "planned for that process." + default
+        ),
+        pid_help=(
+            "Queue bridge operations for this Revit process. Their approval tokens must have been planned for it."
+            + default
+        ),
     )
 
 
@@ -2168,7 +2202,12 @@ def dispatch(args: argparse.Namespace) -> dict:
             value = getattr(args, key, None)
             if value:
                 parameters[key] = value
-        result = plan_ui_workflow(journal, name=args.name, parameters=parameters)
+        resolution = resolve_command_target(sandbox, args.hwnd, args.pid)
+        if resolution and not resolution["success"]:
+            result = {"success": False, "error": resolution["error"], "requested_target": resolution["requested"]}
+        else:
+            target = resolution["target"] if resolution else None
+            result = plan_ui_workflow(journal, name=args.name, parameters=parameters, target=target)
     elif command == "run-ui-workflow":
         parameters = _json_object_arg(args.parameters_json, "parameters-json")
         for key in ("sheet_number", "view_name", "target_name", "target_control_type", "workflow_name"):
@@ -2189,6 +2228,8 @@ def dispatch(args: argparse.Namespace) -> dict:
                 parent_task_id=journal.task_id,
                 allow_sandbox_outside_safe_root=args.allow_sandbox_outside_safe_root,
             ),
+            target_hwnd=args.hwnd,
+            target_pid=args.pid,
         )
     elif command == "record-workflow":
         result = record_workflow(
@@ -2211,6 +2252,8 @@ def dispatch(args: argparse.Namespace) -> dict:
             name=args.name,
             path=Path(args.path) if args.path else None,
             parameters=_json_object_arg(args.parameters_json, "parameters-json"),
+            target_hwnd=args.hwnd,
+            target_pid=args.pid,
         )
     elif command == "replay-workflow":
         result = replay_workflow(
@@ -2225,6 +2268,8 @@ def dispatch(args: argparse.Namespace) -> dict:
             stop_on_modal=not args.continue_on_modal,
             max_steps=args.max_steps,
             recovery_snapshot_on_stop=not args.no_recovery_snapshot,
+            target_hwnd=args.hwnd,
+            target_pid=args.pid,
         )
     elif command == "open-model":
         return {
@@ -2568,10 +2613,13 @@ def dispatch(args: argparse.Namespace) -> dict:
                 expected_title_contains=args.expected_title_contains,
                 max_hours=args.max_hours,
                 parameters=_json_object_arg(args.parameters_json, "parameters-json"),
+                target_hwnd=args.hwnd,
+                target_pid=args.pid,
             ),
             "journal": journal.describe(),
         }
     elif command == "agent-session-execute-approved-item":
+        # The bridge carries --hwnd/--pid; without them the item runs in the Revit process it was approved for.
         return {
             **execute_agent_session_approved_item(
                 journal,

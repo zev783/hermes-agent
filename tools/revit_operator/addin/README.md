@@ -9,7 +9,8 @@ It is intentionally small:
 - writes active document status to the configured sandbox
 - reads queued Hermes commands from `bridge/command_queue.jsonl`
 - writes command results to `bridge/command_results.jsonl`
-- exports read-only metadata to `bridge/metadata_snapshot.json`
+- exports read-only metadata to `bridge/metadata_snapshot.<pid>.json` and
+  `bridge/metadata_snapshot.json`
 
 Every Revit that loads the add-in shares one bridge folder, so:
 
@@ -39,14 +40,23 @@ Every Revit that loads the add-in shares one bridge folder, so:
   refuses a targeted change while a live session on the bridge writes
   per-process status without `supports_command_targets`. Builds older than
   per-process status files cannot be detected.
+- Every `export-metadata` or `qa-snapshot` also writes the shared
+  `metadata_snapshot.json`, an untargeted one in every session, so that file
+  holds whichever export landed last. Each export first writes
+  `metadata_snapshot.<pid>.json`, which only that process writes. The result's
+  `path` names it and `shared_path` names the shared copy. Snapshots carry an
+  `addin` block with the writer's `process_id` and `process_start_utc`.
+  `export-metadata`, `find-view` and `qa-report` with `--hwnd` (or `--pid`)
+  read the target's own snapshot. If the target wrote none, they fall back to
+  the shared snapshot unless it names another process.
 - Commands queued more than 15 minutes before the Revit process started are
   skipped, not replayed. One `skipped_stale_commands` result lists them. A
   command queued just before launching Revit still runs.
 - Status writes rename a per-process temp file over the target, at most once a
   second and without sleeping on the UI thread. A thread-pool timer deletes
   leftover temp files (`*~RF*.TMP` from older builds' `File.Replace`,
-  `*.json.*.tmp`) and the per-process files of exited Revit processes, once
-  they are 10 minutes old.
+  `*.json.*.tmp`) and the per-process status files and metadata snapshots of
+  exited Revit processes, once they are 10 minutes old.
 
 Supported Revit versions and add-in targets:
 

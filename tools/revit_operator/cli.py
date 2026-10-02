@@ -652,6 +652,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     metadata = sub.add_parser("export-metadata", help="Export read-only metadata to sandbox.")
     metadata.add_argument("--output", help="Output path under the selected sandbox.")
+    _add_snapshot_target_args(metadata)
 
     find_view = sub.add_parser("find-view", help="Find views/sheets in metadata for supervised navigation.")
     find_view.add_argument("--query", default="")
@@ -659,6 +660,7 @@ def build_parser() -> argparse.ArgumentParser:
     find_view.add_argument("--sheet-number", default="")
     find_view.add_argument("--view-type", default="")
     find_view.add_argument("--limit", type=int, default=20)
+    _add_snapshot_target_args(find_view)
 
     bridge_results = sub.add_parser("bridge-results", help="List add-in bridge command results.")
     bridge_results.add_argument("--command-id", help="Filter to one command id.")
@@ -962,6 +964,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     qa = sub.add_parser("qa-report", help="Generate a draft QA report from metadata.")
     qa.add_argument("--output", help="Output path under the selected sandbox.")
+    _add_snapshot_target_args(qa)
 
     qa_workflow = sub.add_parser("qa-workflow", help="Run a supervised read-only QA workflow.")
     qa_workflow.add_argument("--timeout", type=float, default=120.0)
@@ -1279,6 +1282,17 @@ def _add_operation_target_args(parser: argparse.ArgumentParser) -> None:
             "operations that change a model or the open documents."
         ),
         pid_help="Queue the operation for this Revit process; other Revit sessions skip it.",
+    )
+
+
+def _add_snapshot_target_args(parser: argparse.ArgumentParser) -> None:
+    _add_bridge_target_args(
+        parser,
+        hwnd_help=(
+            "Prefer the metadata snapshot exported by the Revit that owns this window over the shared, "
+            "last-writer-wins one."
+        ),
+        pid_help="Prefer the metadata snapshot exported by this Revit process over the shared one.",
     )
 
 
@@ -2376,7 +2390,7 @@ def dispatch(args: argparse.Namespace) -> dict:
         }
     elif command == "qa-report":
         output = _output_path(journal, args.output, journal.run_dir / "qa_report.md") if args.output else None
-        return {**generate_qa_report(journal, output), "journal": journal.describe()}
+        return {**generate_qa_report(journal, output, bridge=bridge), "journal": journal.describe()}
     elif command == "qa-workflow":
         return {
             **run_readonly_qa_workflow(

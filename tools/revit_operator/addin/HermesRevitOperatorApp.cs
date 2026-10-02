@@ -62,10 +62,14 @@ public class HermesRevitOperatorApp : IExternalApplication
 
     // The shared status files are last-writer-wins across tandem Revit sessions, so each process also writes
     // addin_status.<pid>.json, addin_heartbeat.<pid>.json and active_document.<pid>.json. Hermes reads the files of
-    // the process that owns its target window; the shared files stay for older readers.
+    // the process that owns its target window; the shared files stay for older readers. Exports from every session
+    // replace the shared metadata snapshot, so each export also writes metadata_snapshot.<pid>.json.
     private static readonly int ProcessId;
     private static readonly DateTime ProcessStartUtc;
-    private static readonly string[] ProcessStatusFileStems = { "addin_status", "addin_heartbeat", "active_document" };
+    private static readonly string[] ProcessFileStems =
+    {
+        "addin_status", "addin_heartbeat", "active_document", "metadata_snapshot"
+    };
 
     // Commands queued this long before the Revit process started belong to an earlier session and are skipped:
     // every start used to replay the whole queue, month-old metadata exports and view switches included. A command
@@ -101,7 +105,8 @@ public class HermesRevitOperatorApp : IExternalApplication
     }
 
     // A thread-pool timer sweeps the bridge folder for temp files that failed writes left behind and for the
-    // per-process status files of exited Revit processes. Files younger than StaleBridgeFileAge are never touched.
+    // per-process status files and metadata snapshots of exited Revit processes. Files younger than
+    // StaleBridgeFileAge are never touched.
     private static readonly TimeSpan StaleBridgeFileAge = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan BridgeSweepDelay = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan BridgeSweepInterval = TimeSpan.FromMinutes(15);
@@ -168,9 +173,10 @@ public class HermesRevitOperatorApp : IExternalApplication
         _sweepTimer = null;
         _uiapp = null;
         TryWriteStatus(() => WriteBridgeStatus("stopped", application.ControlledApplication.VersionNumber));
-        // This process's heartbeat and active document no longer describe a live session.
-        TryDelete(ProcessStatusPath(HeartbeatPath));
-        TryDelete(ProcessStatusPath(ActiveDocumentPath));
+        // This process's heartbeat and active document no longer describe a live session. Its metadata snapshot stays
+        // for Hermes to copy, and the sweep deletes it once it is old enough.
+        TryDelete(ProcessFilePath(HeartbeatPath));
+        TryDelete(ProcessFilePath(ActiveDocumentPath));
         return Result.Succeeded;
     }
 
@@ -182,7 +188,7 @@ public class HermesRevitOperatorApp : IExternalApplication
     private string HeartbeatPath => Path.Combine(BridgeDir, "addin_heartbeat.json");
     private string AddinStatusPath => Path.Combine(BridgeDir, "addin_status.json");
 
-    private string ProcessStatusPath(string sharedPath)
+    private string ProcessFilePath(string sharedPath)
     {
         return Path.Combine(BridgeDir, Path.GetFileNameWithoutExtension(sharedPath) + "." + ProcessId + ".json");
     }
@@ -549,8 +555,7 @@ public class HermesRevitOperatorApp : IExternalApplication
         {
             case "export-metadata":
             case "qa-snapshot":
-                WriteMetadata(uiapp);
-                return Success("Metadata snapshot written.", MetadataPath);
+                return WriteMetadata(uiapp);
             case "save":
                 RequireModelWrite(allowModelWrite, operation);
                 doc.Save();
@@ -784,7 +789,9 @@ public class HermesRevitOperatorApp : IExternalApplication
         WriteStatusFiles(ActiveDocumentPath, payload, retry);
     }
 
-    private void WriteMetadata(UIApplication uiapp)
+    // A tandem session's export can replace the shared snapshot before Hermes copies it, so the per-process snapshot,
+    // which only this Revit writes, is written first and reported as the result's path.
+    private Dictionary<string, object?> WriteMetadata(UIApplication uiapp)
     {
         var doc = uiapp.ActiveUIDocument?.Document;
         if (doc == null)
@@ -797,6 +804,8 @@ public class HermesRevitOperatorApp : IExternalApplication
             ["label"] = "DRAFT / NOT FOR PERMIT / REQUIRES PE REVIEW",
             ["generated_at"] = DateTimeOffset.UtcNow.ToString("O"),
             ["read_only"] = true,
+            // Its process_id and process_start_utc tell Hermes which Revit process wrote the snapshot.
+            ["addin"] = AddinInfo(),
             ["document"] = DocumentInfo(doc, uiapp.Application),
             ["project_info"] = ProjectInfo(doc),
             ["levels"] = ElementsByCategory(doc, BuiltInCategory.OST_Levels),
@@ -809,7 +818,13 @@ public class HermesRevitOperatorApp : IExternalApplication
             ["families"] = Families(doc),
             ["types"] = Types(doc)
         };
-        WriteJsonAtomic(MetadataPath, payload);
+        var json = JsonSerializer.Serialize(payload, IndentedJson);
+        var processPath = ProcessFilePath(MetadataPath);
+        WriteTextAtomic(processPath, json);
+        WriteTextAtomic(MetadataPath, json);
+        var result = Success("Metadata snapshot written.", processPath);
+        result["shared_path"] = MetadataPath;
+        return result;
     }
 
     private Dictionary<string, object?> DocumentInfo(Document doc, Application app)
@@ -1091,7 +1106,7 @@ public class HermesRevitOperatorApp : IExternalApplication
     // so a tandem session holding it never makes this UI thread wait.
     private void WriteStatusFiles(string sharedPath, object payload, bool retry)
     {
-        WriteJsonAtomic(ProcessStatusPath(sharedPath), payload, retry);
+        WriteJsonAtomic(ProcessFilePath(sharedPath), payload, retry);
         TryWriteStatus(() => WriteJsonAtomic(sharedPath, payload, retry: false));
     }
 
@@ -1169,7 +1184,7 @@ public class HermesRevitOperatorApp : IExternalApplication
                 try
                 {
                     if (file.LastWriteTimeUtc < staleBeforeUtc
-                        && (IsLeftoverTempFile(file.Name) || IsExitedProcessStatusFile(file))
+                        && (IsLeftoverTempFile(file.Name) || IsExitedProcessFile(file))
                         && TryDelete(file.FullName))
                     {
                         deleted++;
@@ -1200,9 +1215,9 @@ public class HermesRevitOperatorApp : IExternalApplication
             && BridgeTempFilePrefixes.Any(prefix => name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
     }
 
-    private static bool IsExitedProcessStatusFile(FileInfo file)
+    private static bool IsExitedProcessFile(FileInfo file)
     {
-        var pid = ProcessIdFromStatusFileName(file.Name);
+        var pid = ProcessIdFromFileName(file.Name);
         if (pid == null || pid.Value == ProcessId)
         {
             return false;
@@ -1210,7 +1225,7 @@ public class HermesRevitOperatorApp : IExternalApplication
         try
         {
             using var process = System.Diagnostics.Process.GetProcessById(pid.Value);
-            // A reused PID belongs to a process that started after the status file was last written.
+            // A reused PID belongs to a process that started after the file was last written.
             return !string.Equals(process.ProcessName, "Revit", StringComparison.OrdinalIgnoreCase)
                 || process.StartTime.ToUniversalTime() > file.LastWriteTimeUtc;
         }
@@ -1228,10 +1243,10 @@ public class HermesRevitOperatorApp : IExternalApplication
         }
     }
 
-    private static int? ProcessIdFromStatusFileName(string name)
+    private static int? ProcessIdFromFileName(string name)
     {
         const string extension = ".json";
-        foreach (var stem in ProcessStatusFileStems)
+        foreach (var stem in ProcessFileStems)
         {
             var prefix = stem + ".";
             if (name.Length > prefix.Length + extension.Length
@@ -1249,15 +1264,19 @@ public class HermesRevitOperatorApp : IExternalApplication
         return null;
     }
 
+    private static void WriteJsonAtomic(string path, object payload, bool retry = true)
+    {
+        WriteTextAtomic(path, JsonSerializer.Serialize(payload, IndentedJson), retry);
+    }
+
     // Writes a temp file and renames it over the target. File.Replace is not used: when another process held the
     // target it left "<name>~RF<hex>.TMP" backups behind, ~45k of them in the shared bridge folder. The temp name is
     // per process, so a temp that a failed write leaves is overwritten by the next write instead of accumulating.
-    private static void WriteJsonAtomic(string path, object payload, bool retry = true)
+    private static void WriteTextAtomic(string path, string text, bool retry = true)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path) ?? ".");
         var temp = path + "." + ProcessId + ".tmp";
-        var json = JsonSerializer.Serialize(payload, IndentedJson);
-        WriteAllTextShared(temp, json, retry);
+        WriteAllTextShared(temp, text, retry);
         try
         {
             RunFileOperation(() => MoveReplacing(temp, path), retry);

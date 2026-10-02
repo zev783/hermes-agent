@@ -35,7 +35,7 @@ from tools.revit_operator.dialog_workflows import (
 from tools.revit_operator.execution_audit import audit_ui_execution_coverage
 from tools.revit_operator.journal import TaskJournal
 import tools.revit_operator.model_open_choreography as model_open_choreography
-from tools.revit_operator.navigation import find_view_matches
+from tools.revit_operator.navigation import find_view_matches, find_views
 import tools.revit_operator.north_star as north_star
 from tools.revit_operator.north_star import run_north_star_audit
 from tools.revit_operator.ocr import ocr_health, ocr_screenshot
@@ -50,6 +50,7 @@ from tools.revit_operator.project_browser import (
     run_project_browser_item_activation,
     run_project_browser_visual_activation,
 )
+from tools.revit_operator.qa import generate_qa_report
 from tools.revit_operator.readiness import wait_model_ready
 import tools.revit_operator.revit_locator as revit_locator
 from tools.revit_operator.revit_locator import infer_revit_version_from_model
@@ -497,7 +498,7 @@ def test_revit_addin_bridge_writes_are_retrying_and_reader_tolerant():
     assert 'path + "." + ProcessId + ".tmp"' in source
 
 
-def test_revit_addin_process_status_file_names_match_bridge_client():
+def test_revit_addin_process_file_names_match_bridge_client():
     source = (
         Path(__file__).resolve().parents[2]
         / "tools"
@@ -505,16 +506,41 @@ def test_revit_addin_process_status_file_names_match_bridge_client():
         / "addin"
         / "HermesRevitOperatorApp.cs"
     ).read_text(encoding="utf-8")
-    stems_line = next(line for line in source.splitlines() if "ProcessStatusFileStems =" in line)
-    stems = stems_line.split("{", 1)[1].split("}", 1)[0].replace('"', "").replace(" ", "").split(",")
+    stems_block = source.split("ProcessFileStems =", 1)[1].split("{", 1)[1].split("}", 1)[0]
+    stems = [stem.strip().strip('"') for stem in stems_block.split(",")]
 
-    paths = RevitBridgeClient(Path("sandbox")).process_status_paths(42)
+    bridge = RevitBridgeClient(Path("sandbox"))
+    paths = [*bridge.process_status_paths(42).values(), bridge.process_metadata_snapshot_path(42)]
 
-    assert sorted(path.name for path in paths.values()) == sorted(f"{stem}.42.json" for stem in stems)
+    assert sorted(path.name for path in paths) == sorted(f"{stem}.42.json" for stem in stems)
     assert 'Path.GetFileNameWithoutExtension(sharedPath) + "." + ProcessId + ".json"' in source
+    # The sweep deletes these per-process files once their process has exited.
+    assert "foreach (var stem in ProcessFileStems)" in source
     # The client compares these to reject files that an earlier process with a reused PID left behind.
     assert '["process_id"] = ProcessId' in source
     assert '["process_start_utc"] = ProcessStartUtc' in source
+
+
+def test_revit_addin_metadata_export_writes_process_snapshot_first_and_reports_it():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "tools"
+        / "revit_operator"
+        / "addin"
+        / "HermesRevitOperatorApp.cs"
+    ).read_text(encoding="utf-8")
+    write_metadata = source.split("private Dictionary<string, object?> WriteMetadata(", 1)[1]
+    write_metadata = write_metadata.split("\n    private ", 1)[0]
+
+    assert "return WriteMetadata(uiapp);" in source
+    # The client reads the writer's process_id and process_start_utc from the snapshot's addin block.
+    assert '["addin"] = AddinInfo()' in write_metadata
+    assert write_metadata.index("WriteTextAtomic(processPath, json)") < write_metadata.index(
+        "WriteTextAtomic(MetadataPath, json)"
+    )
+    assert "var processPath = ProcessFilePath(MetadataPath);" in write_metadata
+    assert 'Success("Metadata snapshot written.", processPath)' in write_metadata
+    assert 'result["shared_path"] = MetadataPath;' in write_metadata
 
 
 def test_transmitted_model_dialog_matches_known_rule():
@@ -21123,6 +21149,203 @@ def test_revit_addin_command_targets_follow_the_operator_contract():
     # The loaded-build contract that verify_loaded_build checks is unchanged.
     assert f'OperatorProtocolVersion = "{bridge_module.EXPECTED_BRIDGE_PROTOCOL_VERSION}"' in source
     assert f'SourceCapabilityStamp = "{bridge_module.EXPECTED_SOURCE_CAPABILITY_STAMP}"' in source
+
+
+def _metadata_snapshot(title: str, *, addin: dict | None = None, sheets: list[dict] | None = None) -> dict:
+    snapshot = {
+        "label": DRAFT_LABEL,
+        "read_only": True,
+        "document": {"title": title, "path": f"C:/safe/{title}.rvt", "revit_version": "2025"},
+        "levels": [{"name": "Level 1"}],
+        "grids": [],
+        "views": [],
+        "sheets": sheets or [],
+        "titleblocks": [],
+        "links": [],
+        "warnings": [],
+        "families": [],
+        "types": [],
+    }
+    if addin is not None:
+        snapshot["addin"] = addin
+    return snapshot
+
+
+def test_export_metadata_copies_target_process_snapshot_not_later_shared_export(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge_module, "_process_start_utc", lambda pid: None)
+    bridge = RevitBridgeClient(tmp_path, target_pid=222)
+    _write_bridge_payload(
+        bridge.process_metadata_snapshot_path(222),
+        _metadata_snapshot("Target Model", addin=_current_bridge_addin(222)),
+    )
+    # A tandem session's export replaced the shared snapshot before the copy.
+    _write_bridge_payload(
+        bridge.metadata_snapshot_path,
+        _metadata_snapshot("Other Model", addin=_current_bridge_addin(111)),
+    )
+
+    result = bridge.export_metadata(tmp_path / "copies" / "target.json")
+    untargeted = RevitBridgeClient(tmp_path).export_metadata(tmp_path / "copies" / "shared.json")
+
+    assert result["success"] is True
+    assert result["mode"] == "bridge_snapshot_copy"
+    assert result["snapshot_source"] == "process"
+    assert result["source"] == str(bridge.process_metadata_snapshot_path(222))
+    assert result["target"] == {"hwnd": None, "pid": 222}
+    assert json.loads(Path(result["path"]).read_text(encoding="utf-8"))["document"]["title"] == "Target Model"
+    # Without a target, the shared snapshot is read as before.
+    assert untargeted["snapshot_source"] == "shared"
+    assert json.loads(Path(untargeted["path"]).read_text(encoding="utf-8"))["document"]["title"] == "Other Model"
+
+
+def test_export_metadata_falls_back_to_shared_snapshot_that_names_no_writer(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge_module, "_process_start_utc", lambda pid: None)
+    bridge = RevitBridgeClient(tmp_path, target_pid=222)
+    # Builds older than per-process snapshots write only the shared snapshot, without naming the writer.
+    _write_bridge_payload(bridge.metadata_snapshot_path, _metadata_snapshot("Older Build Model"))
+
+    result = bridge.export_metadata(tmp_path / "metadata.json")
+
+    assert result["success"] is True
+    assert result["mode"] == "bridge_snapshot_copy"
+    assert result["snapshot_source"] == "shared_fallback"
+    assert result["source"] == str(bridge.metadata_snapshot_path)
+    assert "wrote no per-process metadata snapshot" in result["fallback_reason"]
+    assert json.loads(Path(result["path"]).read_text(encoding="utf-8"))["document"]["title"] == "Older Build Model"
+
+
+def test_metadata_readers_refuse_shared_snapshot_another_process_exported(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge_module, "_process_start_utc", lambda pid: None)
+    bridge = RevitBridgeClient(tmp_path, target_pid=222)
+    _write_bridge_payload(
+        bridge.metadata_snapshot_path,
+        _metadata_snapshot(
+            "Other Model",
+            addin=_current_bridge_addin(111),
+            sheets=[{"id": 101, "sheet_number": "S101", "name": "Other Plan", "is_placeholder": False}],
+        ),
+    )
+    journal = TaskJournal(tmp_path, "metadata-other-process-test")
+    output = journal.default_metadata_path("json")
+
+    exported = bridge.export_metadata(output)
+    views = find_views(journal, bridge, sheet_number="S101")
+    report = generate_qa_report(journal, bridge=bridge)
+
+    assert exported["success"] is False
+    assert exported["status"] == "other_process_snapshot"
+    assert exported["writer_process_id"] == 111
+    assert "written by process 111" in exported["error"]
+    assert not output.exists()
+    assert views["success"] is False
+    assert views["error"] == exported["error"]
+    assert report["metadata_source"] is None
+    assert report["snapshot_source"] == "shared_fallback"
+    assert report["writer_process_id"] == 111
+    assert "Other Model" not in Path(report["path"]).read_text(encoding="utf-8")
+
+
+def test_metadata_snapshot_ignores_process_snapshot_left_by_earlier_process_with_same_pid(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        bridge_module,
+        "_process_start_utc",
+        lambda pid: datetime(2026, 10, 2, 15, 0, tzinfo=timezone.utc),
+    )
+    bridge = RevitBridgeClient(tmp_path, target_pid=222)
+    _write_bridge_payload(
+        bridge.process_metadata_snapshot_path(222),
+        _metadata_snapshot("Exited Session", addin=_current_bridge_addin(222, started="2026-09-30T08:00:00.1234567Z")),
+    )
+
+    selection = bridge.metadata_snapshot_selection()
+
+    assert selection["source"] == "shared_fallback"
+    assert selection["path"] == bridge.metadata_snapshot_path
+    assert "earlier process" in selection["fallback_reason"]
+
+
+@pytest.mark.parametrize("command", ["export-metadata", "find-view", "qa-report"])
+def test_cli_metadata_readers_read_target_window_snapshot(tmp_path, capsys, monkeypatch, command):
+    monkeypatch.setattr(bridge_module, "process_id_for_hwnd", lambda hwnd: {4242: 222}.get(hwnd))
+    monkeypatch.setattr(bridge_module, "_process_start_utc", lambda pid: None)
+    bridge_dir = tmp_path / "bridge"
+    _write_bridge_payload(
+        bridge_dir / "metadata_snapshot.json",
+        _metadata_snapshot("Other Model", addin=_current_bridge_addin(111)),
+    )
+    _write_bridge_payload(
+        bridge_dir / "metadata_snapshot.222.json",
+        _metadata_snapshot(
+            "Target Model",
+            addin=_current_bridge_addin(222),
+            sheets=[{"id": 202, "sheet_number": "S101", "name": "Target Plan", "is_placeholder": False}],
+        ),
+    )
+    query = ["--sheet-number", "S101"] if command == "find-view" else []
+
+    code = cli.main(
+        [
+            "--sandbox",
+            str(tmp_path),
+            "--allow-sandbox-outside-safe-root",
+            "--task-id",
+            f"{command}-target-window-test",
+            command,
+            *query,
+            "--hwnd",
+            "4242",
+        ]
+    )
+
+    assert code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["snapshot_source"] == "process"
+    assert output["target"] == {"hwnd": 4242, "pid": 222}
+    assert Path(output.get("metadata_source") or output["source"]).name == "metadata_snapshot.222.json"
+
+
+def test_readonly_qa_workflow_copies_and_reports_target_process_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge_module, "_process_start_utc", lambda pid: None)
+    bridge = RevitBridgeClient(tmp_path, target_pid=222)
+    _write_bridge_payload(
+        bridge.process_metadata_snapshot_path(222),
+        _metadata_snapshot("Target Model", addin=_current_bridge_addin(222)),
+    )
+    _write_bridge_payload(
+        bridge.metadata_snapshot_path,
+        _metadata_snapshot("Other Model", addin=_current_bridge_addin(111)),
+    )
+    # A targeted wait accepts only results that the target process wrote.
+    bridge.command_results_path.write_text(
+        "".join(
+            json.dumps({"id": command_id, "success": True, "process_id": 222}) + "\n"
+            for command_id in ["active-id", "metadata-id"]
+        ),
+        encoding="utf-8",
+    )
+    command_ids = iter(["active-id", "metadata-id"])
+    monkeypatch.setattr(
+        workflows,
+        "queue_operation",
+        lambda _journal, request: {"success": True, "command": {"id": next(command_ids), "operation": request.operation}},
+    )
+
+    class FakeObserver:
+        def status(self):
+            return {"state": "idle", "active_dialogs": []}
+
+    result = run_readonly_qa_workflow(
+        TaskJournal(tmp_path, "workflow-target-process-test"),
+        FakeObserver(),
+        bridge,
+        timeout=0,
+        capture_screenshot=False,
+        capture_ui_tree=False,
+    )
+
+    assert result["success"] is True
+    assert json.loads(Path(result["metadata_path"]).read_text(encoding="utf-8"))["document"]["title"] == "Target Model"
+    assert "- Title: Target Model" in Path(result["qa_report_path"]).read_text(encoding="utf-8")
 
 
 def test_bridge_readiness_requires_restart_when_installed_but_loaded_stale(tmp_path):

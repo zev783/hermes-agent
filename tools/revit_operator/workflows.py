@@ -109,7 +109,7 @@ def run_readonly_qa_workflow(
         if screenshot.get("path"):
             output_files.append(str(screenshot["path"]))
 
-    report = generate_qa_report(journal)
+    report = generate_qa_report(journal, bridge=bridge)
     steps.append({"step": "generate-qa-report", **report})
     if report.get("path"):
         output_files.append(str(report["path"]))

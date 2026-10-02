@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .bridge import RevitBridgeClient
+from .bridge import RevitBridgeClient, metadata_snapshot_fields
 from .journal import TaskJournal
 from .safety import validate_output_path
 
@@ -20,11 +20,15 @@ def find_views(
     view_type: str = "",
     limit: int = 20,
 ) -> dict:
-    metadata_path = _metadata_path(journal, bridge)
+    selection = bridge.metadata_snapshot_selection()
+    source_fields = metadata_snapshot_fields(selection)
+    metadata_path = _metadata_path(journal, selection)
     if not metadata_path:
         return {
             "success": False,
-            "error": "No metadata snapshot available. Run export-metadata or qa-workflow first.",
+            "error": selection.get("error")
+            or "No metadata snapshot available. Run export-metadata or qa-workflow first.",
+            **source_fields,
         }
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     matches = find_view_matches(
@@ -43,6 +47,7 @@ def find_views(
     result = {
         "success": True,
         "metadata_source": str(metadata_path),
+        **source_fields,
         "query": {
             "query": query,
             "view_name": view_name,
@@ -120,9 +125,10 @@ def find_view_matches(
     return matches
 
 
-def _metadata_path(journal: TaskJournal, bridge: RevitBridgeClient) -> Path | None:
-    if bridge.metadata_snapshot_path.exists():
-        return bridge.metadata_snapshot_path
+def _metadata_path(journal: TaskJournal, selection: dict) -> Path | None:
+    snapshot_path = selection["path"]
+    if snapshot_path is not None and snapshot_path.exists():
+        return snapshot_path
     candidates = sorted(journal.metadata_dir.glob("*.json"))
     return candidates[-1] if candidates else None
 

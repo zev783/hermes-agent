@@ -19935,6 +19935,54 @@ def test_request_operation_activate_view_execute_writes_bridge_queue_with_exact_
     assert command["guards"]["allow_model_write"] is False
 
 
+def test_queue_operation_activate_view_id_arg_is_not_the_command_id(tmp_path):
+    args = {"id": 123}
+    payload = {"operation": "activate-view", "args": args, "allow_model_write": False, "allow_sync": False}
+    token = classify_action("request-operation", payload).approval_token
+    journal = TaskJournal(tmp_path, "activate-view-command-id-test")
+
+    results = [
+        operations.queue_operation(
+            journal,
+            operations.OperationRequest(operation="activate-view", args=args, dry_run=False, approval_token=token),
+        )
+        for _ in range(2)
+    ]
+
+    assert [result["success"] for result in results] == [True, True]
+    queue_path = tmp_path / "bridge" / "command_queue.jsonl"
+    queued = [json.loads(line) for line in queue_path.read_text(encoding="utf-8").splitlines()]
+    command_ids = [command["id"] for command in queued]
+    assert command_ids == [result["command"]["id"] for result in results]
+    # The add-in keys a non-string id by queue line and skips an id it has already processed.
+    assert all(isinstance(command_id, str) for command_id in command_ids)
+    assert command_ids[0] != command_ids[1]
+    assert [command["args"] for command in queued] == [{"id": 123}, {"id": 123}]
+
+
+def test_queue_operation_uses_explicit_command_id_field(tmp_path):
+    args = {"id": 123}
+    payload = {"operation": "activate-view", "args": args, "allow_model_write": False, "allow_sync": False}
+    token = classify_action("request-operation", payload).approval_token
+
+    result = operations.queue_operation(
+        TaskJournal(tmp_path, "explicit-command-id-test"),
+        operations.OperationRequest(
+            operation="activate-view",
+            args=args,
+            dry_run=False,
+            approval_token=token,
+            command_id="open-view-123",
+        ),
+    )
+
+    assert result["success"] is True
+    queue_path = tmp_path / "bridge" / "command_queue.jsonl"
+    command = json.loads(queue_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert command["id"] == result["command"]["id"] == "open-view-123"
+    assert command["args"] == {"id": 123}
+
+
 def test_request_operation_execute_writes_bridge_queue_with_exact_token(tmp_path, capsys):
     payload = {
         "operation": "set-project-info-parameter",

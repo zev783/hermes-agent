@@ -39,6 +39,8 @@ class OperationRequest:
     approval_token: str | None = None
     allow_model_write: bool = False
     allow_sync: bool = False
+    # The queued line's id, for wait-bridge-result. Not args["id"]: activate-view reads that as a view id.
+    command_id: str | None = None
 
 
 def validate_model_path(path: Path, allow_outside_safe_root: bool = False) -> str | None:
@@ -154,7 +156,7 @@ def queue_operation(journal: TaskJournal, request: OperationRequest) -> dict:
     allowed, reason = authorize(decision, request.approval_token)
     guard_error = _guard_operation(operation, request)
 
-    command_id = request.args.get("id") or make_task_id(operation.replace("-", "_"))
+    command_id = request.command_id or make_task_id(operation.replace("-", "_"))
     command = {
         "id": command_id,
         "timestamp": utc_now(),

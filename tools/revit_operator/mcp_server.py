@@ -21,11 +21,17 @@ logger = logging.getLogger("hermes.revit_operator.mcp")
 
 _MCP_SERVER_AVAILABLE = False
 try:
-    from mcp.server.fastmcp import FastMCP
+    # mcp 2.0 renamed `mcp.server.fastmcp.FastMCP` to `mcp.server.MCPServer` (same surface).
+    from mcp.server import MCPServer as FastMCP
 
     _MCP_SERVER_AVAILABLE = True
 except ImportError:
-    FastMCP = None  # type: ignore[assignment,misc]
+    try:
+        from mcp.server.fastmcp import FastMCP
+
+        _MCP_SERVER_AVAILABLE = True
+    except ImportError:
+        FastMCP = None  # type: ignore[assignment,misc]
 
 
 BLOCKED_MCP_COMMANDS = {"serve", "mcp-serve"}

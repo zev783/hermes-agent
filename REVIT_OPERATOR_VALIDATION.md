@@ -59,7 +59,12 @@ Run from the repo root:
 
 ```powershell
 python -m compileall -q tools\revit_operator plugins\revit-operator
-python -m pytest -n 0 --basetemp .\.tmp-pytest-revit -q tests\tools\test_revit_operator.py tests\plugins\test_revit_operator_plugin.py
+```
+
+Run the tests from Git Bash with the canonical runner, which runs each file in its own process:
+
+```bash
+scripts/run_tests.sh tests/tools/test_revit_operator_*.py tests/plugins/test_revit_operator_plugin.py
 ```
 
 Build add-in after installing a .NET SDK:

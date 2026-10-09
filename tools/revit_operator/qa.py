@@ -27,7 +27,7 @@ def generate_qa_report(
     source = None
     if metadata_path and metadata_path.exists():
         source = str(metadata_path)
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
 
     output_path = output or (journal.run_dir / "qa_report.md")
     error = validate_output_path(output_path, journal.sandbox)

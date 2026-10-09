@@ -924,7 +924,7 @@ def _stable_completion_audit_blocker_metadata_report(sandbox: Path) -> dict:
             "violations": [],
         }
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (json.JSONDecodeError, OSError) as exc:
         return {
             "status": "violations",
@@ -6411,7 +6411,7 @@ def _latest_approval_preflight_readiness(sandbox: Path) -> dict:
         summary["reason"] = "No stable approval preflight artifact exists yet."
         return {"summary": summary, "items_by_id": {}, "path": str(path), "markdown_path": None}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception as exc:  # pragma: no cover - defensive around hand-edited artifacts
         summary["reason"] = f"Could not read approval preflight artifact: {type(exc).__name__}: {exc}"
         return {"summary": summary, "items_by_id": {}, "path": str(path), "markdown_path": None}
@@ -7659,7 +7659,7 @@ def _approval_plan_markdown(plan: dict) -> str:
         preflight_path = preflight.get("path")
         if preflight_path:
             try:
-                preflight_data = json.loads(Path(str(preflight_path)).read_text(encoding="utf-8"))
+                preflight_data = json.loads(Path(str(preflight_path)).read_text(encoding="utf-8-sig"))
             except Exception:
                 preflight_data = {}
             if isinstance(preflight_data, dict):
@@ -8963,7 +8963,7 @@ def _stable_json_artifact_summary(sandbox: Path, filename: str) -> dict:
         summary["reason"] = "Artifact is not present."
         return summary
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         summary["reason"] = f"Could not parse artifact: {type(exc).__name__}: {exc}"
         summary["json_parse_ok"] = False
@@ -10519,7 +10519,7 @@ def _completion_gate_waiting_state_summary(sandbox: Path) -> dict:
     if not path.exists():
         return result
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception as exc:
         result["reason"] = f"Could not parse waiting-state artifact: {type(exc).__name__}: {exc}"
         return result
@@ -10599,7 +10599,7 @@ def _completion_gate_next_approval_summary(sandbox: Path) -> dict:
     if not path.exists():
         return result
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception as exc:
         result["reason"] = f"Could not parse next-approval artifact: {type(exc).__name__}: {exc}"
         return result
@@ -10633,7 +10633,7 @@ def _completion_gate_next_human_action_summary(sandbox: Path) -> dict:
     if not path.exists():
         return result
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception as exc:
         result["reason"] = f"Could not parse next-human-action artifact: {type(exc).__name__}: {exc}"
         return result
@@ -10994,7 +10994,7 @@ def _status_summary_execution_leak_violations(sandbox: Path) -> list[dict]:
         if not path.exists():
             continue
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            lines = path.read_text(encoding="utf-8-sig").splitlines()
         except OSError as exc:
             violations.append(
                 {
@@ -11022,7 +11022,7 @@ def _status_summary_execution_leak_violations(sandbox: Path) -> list[dict]:
     status_markdown = sandbox / "NORTH_STAR_STATUS_CURRENT.md"
     if status_json.exists():
         try:
-            status_data = json.loads(status_json.read_text(encoding="utf-8"))
+            status_data = json.loads(status_json.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as exc:
             violations.append(
                 {
@@ -11083,7 +11083,7 @@ def _status_summary_execution_leak_violations(sandbox: Path) -> list[dict]:
                     )
                 else:
                     try:
-                        markdown_text = status_markdown.read_text(encoding="utf-8")
+                        markdown_text = status_markdown.read_text(encoding="utf-8-sig")
                     except OSError as exc:
                         violations.append(
                             {
@@ -11185,7 +11185,7 @@ def _stale_approval_credential_leak_violations(sandbox: Path) -> list[dict]:
         if not path.exists():
             continue
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            lines = path.read_text(encoding="utf-8-sig").splitlines()
         except OSError as exc:
             violations.append(
                 {
@@ -11236,7 +11236,7 @@ def _preflight_refresh_advisory_credential_violations(
         if not path.exists():
             continue
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            lines = path.read_text(encoding="utf-8-sig").splitlines()
         except OSError as exc:
             violations.append(
                 {
@@ -11444,7 +11444,7 @@ def _stable_approval_phrase_metadata_report(sandbox: Path) -> dict:
             continue
         result["checked_artifact_count"] += 1
         try:
-            text = path.read_text(encoding="utf-8")
+            text = path.read_text(encoding="utf-8-sig")
         except OSError as exc:
             result["violations"].append(
                 {
@@ -11566,7 +11566,7 @@ def _next_human_action_approval_coverage_report(sandbox: Path) -> dict:
     if not path.exists():
         return result
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Next-human-action current artifact could not be read."
@@ -11778,7 +11778,7 @@ def _completion_gate_markdown_approval_coverage_report(
         )
         return result
     try:
-        markdown_text = markdown_path.read_text(encoding="utf-8")
+        markdown_text = markdown_path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         result["status"] = "violations"
         result["reason"] = "Completion gate markdown could not be read."
@@ -11795,7 +11795,7 @@ def _completion_gate_markdown_approval_coverage_report(
         )
         return result
     try:
-        data = json.loads(next_human_path.read_text(encoding="utf-8"))
+        data = json.loads(next_human_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Next-human-action current JSON could not be read."
@@ -11954,8 +11954,8 @@ def _next_human_action_markdown_approval_coverage_report(
         )
         return result
     try:
-        data = json.loads(source_path.read_text(encoding="utf-8"))
-        markdown_text = markdown_path.read_text(encoding="utf-8")
+        data = json.loads(source_path.read_text(encoding="utf-8-sig"))
+        markdown_text = markdown_path.read_text(encoding="utf-8-sig")
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Next-human-action approval coverage artifacts could not be read."
@@ -12066,7 +12066,7 @@ def _next_human_action_markdown_bridge_cause_report(sandbox: Path) -> dict:
     if not source_path.exists():
         return result
     try:
-        data = json.loads(source_path.read_text(encoding="utf-8"))
+        data = json.loads(source_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Next-human-action JSON could not be read."
@@ -12152,7 +12152,7 @@ def _next_human_action_markdown_bridge_cause_report(sandbox: Path) -> dict:
         )
         return result
     try:
-        markdown_text = markdown_path.read_text(encoding="utf-8")
+        markdown_text = markdown_path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         result["status"] = "violations"
         result["reason"] = "Next-human-action Markdown could not be read."
@@ -12231,7 +12231,7 @@ def _next_human_action_restart_checklist_path_report(sandbox: Path) -> dict:
     if not path.exists():
         return result
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Next-human-action JSON could not be read."
@@ -12321,7 +12321,7 @@ def _next_human_action_restart_checklist_path_report(sandbox: Path) -> dict:
         )
     else:
         try:
-            markdown_text = markdown_path.read_text(encoding="utf-8")
+            markdown_text = markdown_path.read_text(encoding="utf-8-sig")
         except OSError as exc:
             result["markdown_line_present"] = False
             result["violations"].append(
@@ -12389,7 +12389,7 @@ def _next_human_action_resume_script_path_report(sandbox: Path) -> dict:
     if not path.exists():
         return result
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Next-human-action JSON could not be read."
@@ -12471,7 +12471,7 @@ def _next_human_action_resume_script_path_report(sandbox: Path) -> dict:
         )
     else:
         try:
-            markdown_text = markdown_path.read_text(encoding="utf-8")
+            markdown_text = markdown_path.read_text(encoding="utf-8-sig")
         except OSError as exc:
             result["markdown_line_present"] = False
             result["violations"].append(
@@ -12550,7 +12550,7 @@ def _next_human_action_resume_command_report(sandbox: Path) -> dict:
     if not path.exists():
         return result
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Next-human-action JSON could not be read."
@@ -12905,7 +12905,7 @@ def _next_human_action_resume_command_report(sandbox: Path) -> dict:
         )
     else:
         try:
-            markdown_text = markdown_path.read_text(encoding="utf-8")
+            markdown_text = markdown_path.read_text(encoding="utf-8-sig")
         except OSError as exc:
             result["markdown_line_present"] = False
             result["violations"].append(
@@ -13008,7 +13008,7 @@ def _human_real_condition_boundary_report(sandbox: Path) -> dict:
         result["reason"] = "No stable completion gate exists to define the human/real-condition boundary."
         return result
     try:
-        gate = json.loads(gate_path.read_text(encoding="utf-8"))
+        gate = json.loads(gate_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Stable completion gate could not be read."
@@ -13069,7 +13069,7 @@ def _human_real_condition_boundary_report(sandbox: Path) -> dict:
             continue
         result["checked_artifact_count"] += 1
         try:
-            data = json.loads(json_path.read_text(encoding="utf-8"))
+            data = json.loads(json_path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as exc:
             result["violations"].append(
                 {
@@ -13165,7 +13165,7 @@ def _human_real_condition_boundary_report(sandbox: Path) -> dict:
             result["artifact_summaries"].append(summary)
             continue
         try:
-            markdown_text = markdown_path.read_text(encoding="utf-8")
+            markdown_text = markdown_path.read_text(encoding="utf-8-sig")
         except OSError as exc:
             result["violations"].append(
                 {
@@ -13231,7 +13231,7 @@ def _restart_no_save_checklist_bridge_cause_report(sandbox: Path) -> dict:
     if not source_path.exists():
         return result
     try:
-        data = json.loads(source_path.read_text(encoding="utf-8"))
+        data = json.loads(source_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Next-human-action JSON could not be read."
@@ -13329,7 +13329,7 @@ def _restart_no_save_checklist_bridge_cause_report(sandbox: Path) -> dict:
         )
         return result
     try:
-        checklist_text = checklist_path.read_text(encoding="utf-8")
+        checklist_text = checklist_path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         result["status"] = "violations"
         result["reason"] = "Bridge restart no-save checklist could not be read."
@@ -13486,7 +13486,7 @@ def _restart_no_save_checklist_addin_preflight_report(sandbox: Path) -> dict:
         )
         return result
     try:
-        checklist_text = checklist_path.read_text(encoding="utf-8")
+        checklist_text = checklist_path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         result["status"] = "violations"
         result["reason"] = "Bridge restart no-save checklist could not be read."
@@ -13556,7 +13556,7 @@ def _restart_no_save_checklist_completion_guard_report(sandbox: Path) -> dict:
     if not source_path.exists():
         return result
     try:
-        data = json.loads(source_path.read_text(encoding="utf-8"))
+        data = json.loads(source_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Next-human-action JSON could not be read."
@@ -13623,7 +13623,7 @@ def _restart_no_save_checklist_completion_guard_report(sandbox: Path) -> dict:
         )
         return result
     try:
-        checklist_text = checklist_path.read_text(encoding="utf-8")
+        checklist_text = checklist_path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         result["status"] = "violations"
         result["reason"] = "Bridge restart no-save checklist could not be read."
@@ -13704,7 +13704,7 @@ def _restart_no_save_checklist_freshness_report(sandbox: Path) -> dict:
     if not next_human_path.exists():
         return result
     try:
-        next_human = json.loads(next_human_path.read_text(encoding="utf-8"))
+        next_human = json.loads(next_human_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Next-human-action JSON could not be read."
@@ -13939,7 +13939,7 @@ def _completion_gate_markdown_safety_count_report(sandbox: Path) -> dict:
         result["reason"] = "No stable completion gate JSON exists to mirror."
         return result
     try:
-        data = json.loads(source_path.read_text(encoding="utf-8"))
+        data = json.loads(source_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Completion gate current JSON could not be read."
@@ -13987,7 +13987,7 @@ def _completion_gate_markdown_safety_count_report(sandbox: Path) -> dict:
         )
         return result
     try:
-        markdown_text = markdown_path.read_text(encoding="utf-8")
+        markdown_text = markdown_path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         result["status"] = "violations"
         result["reason"] = "Completion gate markdown could not be read."
@@ -14062,7 +14062,7 @@ def _unblock_readiness_markdown_completion_guard_report(sandbox: Path) -> dict:
     if not source_path.exists():
         return result
     try:
-        data = json.loads(source_path.read_text(encoding="utf-8"))
+        data = json.loads(source_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Unblock-readiness current JSON could not be read."
@@ -14131,7 +14131,7 @@ def _unblock_readiness_markdown_completion_guard_report(sandbox: Path) -> dict:
         )
         return result
     try:
-        markdown_text = markdown_path.read_text(encoding="utf-8")
+        markdown_text = markdown_path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         result["status"] = "violations"
         result["reason"] = "Unblock-readiness markdown could not be read."
@@ -14212,7 +14212,7 @@ def _human_gate_packet_markdown_completion_guard_report(sandbox: Path) -> dict:
     if not source_path.exists():
         return result
     try:
-        data = json.loads(source_path.read_text(encoding="utf-8"))
+        data = json.loads(source_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Human gate packet current JSON could not be read."
@@ -14281,7 +14281,7 @@ def _human_gate_packet_markdown_completion_guard_report(sandbox: Path) -> dict:
         )
         return result
     try:
-        markdown_text = markdown_path.read_text(encoding="utf-8")
+        markdown_text = markdown_path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         result["status"] = "violations"
         result["reason"] = "Human gate packet markdown could not be read."
@@ -14354,7 +14354,7 @@ def _human_gate_packet_markdown_approval_gap_report(sandbox: Path) -> dict:
     if not source_path.exists():
         return result
     try:
-        data = json.loads(source_path.read_text(encoding="utf-8"))
+        data = json.loads(source_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Human gate packet current JSON could not be read."
@@ -14419,7 +14419,7 @@ def _human_gate_packet_markdown_approval_gap_report(sandbox: Path) -> dict:
         )
         return result
     try:
-        markdown_text = markdown_path.read_text(encoding="utf-8")
+        markdown_text = markdown_path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         result["status"] = "violations"
         result["reason"] = "Human gate packet markdown could not be read."
@@ -14495,7 +14495,7 @@ def _next_human_action_markdown_completion_guard_report(sandbox: Path) -> dict:
     if not source_path.exists():
         return result
     try:
-        data = json.loads(source_path.read_text(encoding="utf-8"))
+        data = json.loads(source_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Next human action current JSON could not be read."
@@ -14564,7 +14564,7 @@ def _next_human_action_markdown_completion_guard_report(sandbox: Path) -> dict:
         )
         return result
     try:
-        markdown_text = markdown_path.read_text(encoding="utf-8")
+        markdown_text = markdown_path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         result["status"] = "violations"
         result["reason"] = "Next human action markdown could not be read."
@@ -14640,7 +14640,7 @@ def _ready_approvals_markdown_execution_guard_report(sandbox: Path) -> dict:
     if not source_path.exists():
         return result
     try:
-        data = json.loads(source_path.read_text(encoding="utf-8"))
+        data = json.loads(source_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Ready approvals current JSON could not be read."
@@ -14709,7 +14709,7 @@ def _ready_approvals_markdown_execution_guard_report(sandbox: Path) -> dict:
         )
         return result
     try:
-        markdown_text = markdown_path.read_text(encoding="utf-8")
+        markdown_text = markdown_path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         result["status"] = "violations"
         result["reason"] = "Ready approvals markdown could not be read."
@@ -14801,7 +14801,7 @@ def _ready_approvals_markdown_approval_gap_report(sandbox: Path) -> dict:
     if not source_path.exists():
         return result
     try:
-        data = json.loads(source_path.read_text(encoding="utf-8"))
+        data = json.loads(source_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Ready approvals current JSON could not be read."
@@ -14871,7 +14871,7 @@ def _ready_approvals_markdown_approval_gap_report(sandbox: Path) -> dict:
         )
         return result
     try:
-        markdown_text = markdown_path.read_text(encoding="utf-8")
+        markdown_text = markdown_path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         result["status"] = "violations"
         result["reason"] = "Ready approvals markdown could not be read."
@@ -14947,7 +14947,7 @@ def _next_approval_markdown_approval_gap_report(sandbox: Path) -> dict:
     if not source_path.exists():
         return result
     try:
-        data = json.loads(source_path.read_text(encoding="utf-8"))
+        data = json.loads(source_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Next approval current JSON could not be read."
@@ -15006,7 +15006,7 @@ def _next_approval_markdown_approval_gap_report(sandbox: Path) -> dict:
         )
         return result
     try:
-        markdown_text = markdown_path.read_text(encoding="utf-8")
+        markdown_text = markdown_path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         result["status"] = "violations"
         result["reason"] = "Next approval markdown could not be read."
@@ -15083,7 +15083,7 @@ def _waiting_state_approval_gap_report(sandbox: Path) -> dict:
     if not path.exists():
         return result
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Waiting-state current JSON could not be read."
@@ -15120,7 +15120,7 @@ def _waiting_state_approval_gap_report(sandbox: Path) -> dict:
     expected_gap_ids: list[str] | None = None
     if source_path.exists():
         try:
-            source_data = json.loads(source_path.read_text(encoding="utf-8"))
+            source_data = json.loads(source_path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as exc:
             result["violations"].append(
                 {
@@ -15200,7 +15200,7 @@ def _waiting_state_approval_gap_report(sandbox: Path) -> dict:
         result["missing_line_count"] = 1
     else:
         try:
-            markdown_text = markdown_path.read_text(encoding="utf-8")
+            markdown_text = markdown_path.read_text(encoding="utf-8-sig")
         except OSError as exc:
             result["violations"].append(
                 {
@@ -15268,7 +15268,7 @@ def _stable_authority_markdown_mirror_report(sandbox: Path) -> dict:
             result["skipped_missing_markdown"].append(source_path.name)
             continue
         try:
-            data = json.loads(source_path.read_text(encoding="utf-8"))
+            data = json.loads(source_path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as exc:
             result["violations"].append(
                 {
@@ -15294,7 +15294,7 @@ def _stable_authority_markdown_mirror_report(sandbox: Path) -> dict:
         result["checked_artifact_count"] += 1
         result["checked_key_count"] += len(expected_lines)
         try:
-            markdown_text = markdown_path.read_text(encoding="utf-8")
+            markdown_text = markdown_path.read_text(encoding="utf-8-sig")
         except OSError as exc:
             result["violations"].append(
                 {
@@ -15354,7 +15354,7 @@ def _stable_recovery_snapshot_qualification_report(sandbox: Path) -> dict:
         task_id = path.parent.name
         result["checked_snapshot_count"] += 1
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as exc:
             result["unreadable_snapshot_count"] += 1
             result["violations"].append(
@@ -15478,7 +15478,7 @@ def _legacy_blocked_handoff_markdown_completion_guard_report(sandbox: Path) -> d
     if not source_path.exists():
         return result
     try:
-        data = json.loads(source_path.read_text(encoding="utf-8"))
+        data = json.loads(source_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Legacy blocked handoff JSON could not be read."
@@ -15548,7 +15548,7 @@ def _legacy_blocked_handoff_markdown_completion_guard_report(sandbox: Path) -> d
         )
         return result
     try:
-        markdown_text = markdown_path.read_text(encoding="utf-8")
+        markdown_text = markdown_path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         result["status"] = "violations"
         result["reason"] = "Legacy blocked handoff markdown could not be read."
@@ -15637,7 +15637,7 @@ def _handoff_markdown_completion_guard_report(sandbox: Path) -> dict:
     if not source_path.exists():
         return result
     try:
-        data = json.loads(source_path.read_text(encoding="utf-8"))
+        data = json.loads(source_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Current handoff JSON could not be read."
@@ -15761,7 +15761,7 @@ def _handoff_markdown_completion_guard_report(sandbox: Path) -> dict:
         )
         return result
     try:
-        markdown_text = markdown_path.read_text(encoding="utf-8")
+        markdown_text = markdown_path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         result["status"] = "violations"
         result["reason"] = "Current handoff markdown could not be read."
@@ -15912,7 +15912,7 @@ def _stable_readonly_script_guard_report(sandbox: Path) -> dict:
 
         result["checked_script_count"] += 1
         try:
-            text = path.read_text(encoding="utf-8")
+            text = path.read_text(encoding="utf-8-sig")
         except OSError as exc:
             result["violations"].append(
                 {
@@ -16245,7 +16245,7 @@ def _stable_current_artifact_inventory(sandbox: Path) -> list[dict]:
         try:
             entry["size_bytes"] = path.stat().st_size
             if entry["is_json"]:
-                json.loads(path.read_text(encoding="utf-8"))
+                json.loads(path.read_text(encoding="utf-8-sig"))
                 entry["json_parse_ok"] = True
         except (OSError, json.JSONDecodeError) as exc:
             entry["json_parse_ok"] = False if entry["is_json"] else None
@@ -16286,7 +16286,7 @@ def _stable_artifact_consistency_report(sandbox: Path) -> dict:
     if completion_gate_path.exists():
         try:
             completion_gate_data = json.loads(
-                completion_gate_path.read_text(encoding="utf-8")
+                completion_gate_path.read_text(encoding="utf-8-sig")
             )
             completion_gate_allowed = completion_gate_data.get("completion_allowed")
             completion_gate_blocked_gap_ids = _stable_blocked_gap_ids(
@@ -16302,7 +16302,7 @@ def _stable_artifact_consistency_report(sandbox: Path) -> dict:
             summaries.append({"artifact": artifact_name, "present": False})
             continue
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as exc:
             summaries.append(
                 {
@@ -16748,7 +16748,7 @@ def _stable_handoff_file_reference_report(sandbox: Path) -> dict:
         return result
 
     try:
-        handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+        handoff = json.loads(handoff_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Stable current handoff JSON could not be parsed."
@@ -16842,7 +16842,7 @@ def _stable_handoff_file_reference_report(sandbox: Path) -> dict:
         result["present_count"] += 1
         if ref_path.suffix.lower() == ".json":
             try:
-                json.loads(ref_path.read_text(encoding="utf-8"))
+                json.loads(ref_path.read_text(encoding="utf-8-sig"))
                 reference["json_parse_ok"] = True
             except (OSError, json.JSONDecodeError) as exc:
                 reference["json_parse_ok"] = False
@@ -16895,7 +16895,7 @@ def _stable_current_metadata_guard_report(sandbox: Path) -> dict:
             continue
         result["checked_artifact_count"] += 1
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as exc:
             result["unreadable_artifact_count"] += 1
             summary["json_parse_ok"] = False
@@ -17054,7 +17054,7 @@ def _transport_safety_matrix_report(sandbox: Path) -> dict:
         return result
 
     try:
-        raw_text = json_path.read_text(encoding="utf-8")
+        raw_text = json_path.read_text(encoding="utf-8-sig")
         data = json.loads(raw_text)
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
@@ -17256,7 +17256,7 @@ def _transport_safety_matrix_report(sandbox: Path) -> dict:
         )
     else:
         try:
-            markdown_text = markdown_path.read_text(encoding="utf-8")
+            markdown_text = markdown_path.read_text(encoding="utf-8-sig")
         except OSError as exc:
             result["violations"].append(
                 {
@@ -17356,7 +17356,7 @@ def _human_unblock_brief_redaction_report(sandbox: Path) -> dict:
         return result
 
     try:
-        raw_text = json_path.read_text(encoding="utf-8")
+        raw_text = json_path.read_text(encoding="utf-8-sig")
         data = json.loads(raw_text)
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
@@ -17528,7 +17528,7 @@ def _human_unblock_brief_redaction_report(sandbox: Path) -> dict:
         )
     else:
         try:
-            markdown_text = markdown_path.read_text(encoding="utf-8")
+            markdown_text = markdown_path.read_text(encoding="utf-8-sig")
         except OSError as exc:
             result["violations"].append(
                 {
@@ -17609,7 +17609,7 @@ def _unblock_readiness_refresh_command_report(sandbox: Path) -> dict:
         return result
 
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Stable unblock-readiness JSON could not be parsed."
@@ -17758,7 +17758,7 @@ def _unblock_readiness_stable_scan_mirror_report(sandbox: Path) -> dict:
         return result
 
     try:
-        unblock = json.loads(unblock_path.read_text(encoding="utf-8"))
+        unblock = json.loads(unblock_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Stable unblock-readiness JSON could not be parsed."
@@ -17794,7 +17794,7 @@ def _unblock_readiness_stable_scan_mirror_report(sandbox: Path) -> dict:
         actual_violation_count = None
     else:
         try:
-            stable_scan = json.loads(scan_path.read_text(encoding="utf-8"))
+            stable_scan = json.loads(scan_path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as exc:
             result["status"] = "violations"
             result["reason"] = "Stable scan current JSON could not be parsed."
@@ -18018,7 +18018,7 @@ def _handoff_next_human_options_mirror_report(sandbox: Path) -> dict:
     if not handoff_path.exists():
         return result
     try:
-        handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+        handoff = json.loads(handoff_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Stable current handoff JSON could not be parsed."
@@ -18056,7 +18056,7 @@ def _handoff_next_human_options_mirror_report(sandbox: Path) -> dict:
         source = {"option_count": 0, "option_ids": [], "option_summaries": []}
     else:
         try:
-            next_human = json.loads(next_human_path.read_text(encoding="utf-8"))
+            next_human = json.loads(next_human_path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as exc:
             result["status"] = "violations"
             result["reason"] = "Stable next-human-action JSON could not be parsed."
@@ -18182,7 +18182,7 @@ def _unblock_readiness_next_human_options_mirror_report(sandbox: Path) -> dict:
     if not unblock_path.exists():
         return result
     try:
-        unblock = json.loads(unblock_path.read_text(encoding="utf-8"))
+        unblock = json.loads(unblock_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Stable unblock-readiness JSON could not be parsed."
@@ -18215,7 +18215,7 @@ def _unblock_readiness_next_human_options_mirror_report(sandbox: Path) -> dict:
         source = {"option_count": 0, "option_ids": [], "option_summaries": []}
     else:
         try:
-            next_human = json.loads(next_human_path.read_text(encoding="utf-8"))
+            next_human = json.loads(next_human_path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as exc:
             result["status"] = "violations"
             result["reason"] = "Stable next-human-action JSON could not be parsed."
@@ -18351,7 +18351,7 @@ def _unblock_readiness_autonomous_stop_report(sandbox: Path) -> dict:
         return result
 
     try:
-        unblock = json.loads(unblock_path.read_text(encoding="utf-8"))
+        unblock = json.loads(unblock_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Stable unblock-readiness JSON could not be parsed."
@@ -18388,7 +18388,7 @@ def _unblock_readiness_autonomous_stop_report(sandbox: Path) -> dict:
         )
         return result
     try:
-        gate = json.loads(gate_path.read_text(encoding="utf-8"))
+        gate = json.loads(gate_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Stable completion gate JSON could not be parsed."
@@ -18529,7 +18529,7 @@ def _unblock_readiness_autonomous_stop_report(sandbox: Path) -> dict:
         )
     else:
         try:
-            markdown_text = markdown_path.read_text(encoding="utf-8")
+            markdown_text = markdown_path.read_text(encoding="utf-8-sig")
         except OSError as exc:
             result["violations"].append(
                 {
@@ -18639,7 +18639,7 @@ def _agent_stop_status_boundary_report(sandbox: Path) -> dict:
         return result
 
     try:
-        stop = json.loads(stop_path.read_text(encoding="utf-8"))
+        stop = json.loads(stop_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Stable agent stop-status JSON could not be parsed."
@@ -18674,7 +18674,7 @@ def _agent_stop_status_boundary_report(sandbox: Path) -> dict:
         result["reason"] = "No stable completion gate is present to compare."
         return result
     try:
-        gate = json.loads(gate_path.read_text(encoding="utf-8"))
+        gate = json.loads(gate_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         result["status"] = "violations"
         result["reason"] = "Stable completion gate JSON could not be parsed."
@@ -18858,7 +18858,7 @@ def _agent_stop_status_boundary_report(sandbox: Path) -> dict:
         )
     else:
         try:
-            markdown_text = markdown_path.read_text(encoding="utf-8")
+            markdown_text = markdown_path.read_text(encoding="utf-8-sig")
         except OSError as exc:
             result["violations"].append(
                 {
@@ -19727,7 +19727,7 @@ def _completion_gate_expected_context(sandbox: Path) -> dict:
     if not path.exists():
         return result
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception as exc:
         result["reason"] = f"Could not parse approval-preflight artifact: {type(exc).__name__}: {exc}"
         return result
@@ -22294,7 +22294,7 @@ def _refresh_agent_stop_status_for_gate(
     brief_path = journal.sandbox / "NORTH_STAR_HUMAN_UNBLOCK_BRIEF_CURRENT.json"
     if brief_path.exists():
         try:
-            loaded = json.loads(brief_path.read_text(encoding="utf-8"))
+            loaded = json.loads(brief_path.read_text(encoding="utf-8-sig"))
             if isinstance(loaded, dict):
                 human_unblock_brief = loaded
         except (OSError, json.JSONDecodeError):
@@ -23570,7 +23570,7 @@ def _latest_json_artifact(sandbox: Path, name: str) -> dict:
         return {"available": False, "artifact_name": name}
     path = paths[0]
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         return {
             "available": False,
@@ -23595,7 +23595,7 @@ def _task_json_artifact(sandbox: Path, *, task_id: str, name: str) -> dict:
     if not path.exists():
         return {"available": False, "artifact_name": name, "task_id": task_id}
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         return {
             "available": False,
@@ -23651,7 +23651,7 @@ def _latest_journal_command(
     if not path.exists():
         return {"available": False, "task_id": task_id, "command": command}
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
     except OSError as exc:
         return {
             "available": False,
@@ -23761,7 +23761,7 @@ def _recovery_drill_evidence(sandbox: Path) -> dict:
     for path in paths:
         task_id = path.parent.name
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as exc:
             evaluated.append(
                 {

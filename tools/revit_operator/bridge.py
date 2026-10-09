@@ -705,7 +705,7 @@ class RevitBridgeClient:
         last_error: dict | None = None
         for attempt in range(max(1, attempts)):
             try:
-                return path.read_text(encoding="utf-8"), None
+                return path.read_text(encoding="utf-8-sig"), None
             except FileNotFoundError:
                 return "", {
                     "available": False,
@@ -924,7 +924,7 @@ def _read_manifest_assembly(path: Path) -> dict:
             "assembly_path": None,
         }
     try:
-        root = ET.fromstring(path.read_text(encoding="utf-8"))
+        root = ET.fromstring(path.read_text(encoding="utf-8-sig"))
     except ET.ParseError as exc:
         return {
             "available": False,

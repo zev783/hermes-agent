@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest'
-import { planTracker } from '../tests/install/e2e-assets/red-tracker.mjs'
+import { planTracker, runTracker } from '../tests/install/e2e-assets/red-tracker.mjs'
 
 const run = (conclusion) => ({ conclusion, html_url: 'https://example.test/runs/1', head_sha: 'abcdef0123456789', created_at: '2026-09-26T19:24:13Z' })
 const leg = (name, conclusion, step) => ({ name, conclusion, html_url: `https://example.test/job/${name.length}`, steps: step ? [{ name: 'checkout', conclusion: 'success' }, { name: step, conclusion }] : [] })
@@ -22,4 +22,19 @@ test('one tracker: a red run opens it, the next red run rewrites it, a green run
   expect(planTracker(run('failure'), jobs, { number: 7 }).action).toBe('update')
   expect(planTracker(run('success'), [jobs[2]], { number: 7 }).action).toBe('close')
   expect(planTracker(run('success'), [jobs[2]], null).action).toBe('none')
+})
+
+test('a repository with issues disabled never attempts issue reads or writes', () => {
+  const calls = []
+  runTracker('fixture/fork', '1', false, args => {
+    calls.push(args)
+    return JSON.stringify({ has_issues: false })
+  })
+  expect(calls).toEqual([['api', 'repos/fixture/fork']])
+})
+
+test('metadata access failures remain failures rather than silently disabling tracking', () => {
+  expect(() => runTracker('fixture/fork', '1', false, () => {
+    throw new Error('permission denied')
+  })).toThrow('permission denied')
 })

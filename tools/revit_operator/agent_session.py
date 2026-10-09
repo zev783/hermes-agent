@@ -1225,7 +1225,7 @@ def execute_agent_session_approved_item(
         return {"success": False, "error": path_error}
     if not approval_material_path.exists():
         return {"success": False, "error": f"Approval material not found: {approval_material_path}"}
-    material = json.loads(approval_material_path.read_text(encoding="utf-8"))
+    material = json.loads(approval_material_path.read_text(encoding="utf-8-sig"))
     item = _find_private_approval_item(material, item_id)
     if item is None:
         return {"success": False, "error": f"Approval item not found: {item_id}"}
@@ -1558,7 +1558,7 @@ def build_ui_flow_candidate_approval_plan(
             "journal": journal.describe(),
         }
     try:
-        scout = json.loads(scout_path.read_text(encoding="utf-8"))
+        scout = json.loads(scout_path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as exc:
         return {
             "success": False,
@@ -1679,7 +1679,7 @@ def execute_ui_flow_approved_candidate(
             "may_call_update_goal": False,
         }
     try:
-        material = json.loads(approval_material_path.read_text(encoding="utf-8"))
+        material = json.loads(approval_material_path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as exc:
         return {
             "success": False,
@@ -2693,7 +2693,7 @@ def _completion_artifact_inventory(root: Path, sandbox: Path, *, max_artifacts: 
             )
             continue
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
         except Exception as exc:
             skipped.append(
                 {

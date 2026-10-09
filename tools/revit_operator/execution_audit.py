@@ -120,7 +120,7 @@ def _journal_paths(sandbox: Path) -> list[Path]:
 def _read_jsonl(path: Path) -> list[dict]:
     records = []
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
     except OSError:
         return records
     for line in lines:

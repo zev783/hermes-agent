@@ -513,6 +513,25 @@ def test_export_metadata_falls_back_to_shared_snapshot_that_names_no_writer(tmp_
     assert json.loads(Path(result["path"]).read_text(encoding="utf-8"))["document"]["title"] == "Older Build Model"
 
 
+@pytest.mark.parametrize("bom", [False, True])
+def test_metadata_readers_accept_bom_without_changing_document_identity(tmp_path, monkeypatch, bom):
+    monkeypatch.setattr(bridge_module, "_process_start_utc", lambda pid: None)
+    bridge = RevitBridgeClient(tmp_path, target_pid=222)
+    source = bridge.process_metadata_snapshot_path(222)
+    source.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(_metadata_snapshot("Target Model", addin=_current_bridge_addin(222))).encode("utf-8")
+    source.write_bytes((b"\xef\xbb\xbf" if bom else b"") + payload)
+    journal = TaskJournal(tmp_path, "bom-metadata")
+
+    exported = bridge.export_metadata(tmp_path / "copies" / "metadata.json")
+    report = generate_qa_report(journal, bridge=bridge)
+
+    assert exported["success"] is True
+    assert exported["source"] == str(source)
+    assert "Target Model" in Path(report["path"]).read_text(encoding="utf-8-sig")
+    assert report["metadata_source"] == str(source)
+
+
 def test_metadata_readers_refuse_shared_snapshot_another_process_exported(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge_module, "_process_start_utc", lambda pid: None)
     bridge = RevitBridgeClient(tmp_path, target_pid=222)

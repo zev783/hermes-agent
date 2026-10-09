@@ -85,30 +85,39 @@ async function main() {
   const repo = process.env.GITHUB_REPOSITORY;
   const runId = values['run-id'];
   if (!repo || !runId || !/^\d+$/.test(runId)) throw new Error('need GITHUB_REPOSITORY and a numeric --run-id');
-  const run = JSON.parse(gh(['api', `repos/${repo}/actions/runs/${runId}`]));
-  const jobs = gh(['api', '--paginate', `repos/${repo}/actions/runs/${runId}/jobs?per_page=100`,
+  runTracker(repo, runId, values['dry-run']);
+}
+
+export function runTracker(repo, runId, dryRun = false, runGh = gh) {
+  const metadata = JSON.parse(runGh(['api', `repos/${repo}`]));
+  if (metadata.has_issues === false) {
+    console.log('::notice::Issue tracking is disabled in this repository; inspect the install E2E run for its result.');
+    return;
+  }
+  const run = JSON.parse(runGh(['api', `repos/${repo}/actions/runs/${runId}`]));
+  const jobs = runGh(['api', '--paginate', `repos/${repo}/actions/runs/${runId}/jobs?per_page=100`,
     '--jq', '.jobs[] | {name, conclusion, html_url, steps: [.steps[]? | {name, conclusion}]}'])
     .split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
-  const open = JSON.parse(gh(['api', `repos/${repo}/issues?labels=${LABEL}&state=open&per_page=5`]))
+  const open = JSON.parse(runGh(['api', `repos/${repo}/issues?labels=${LABEL}&state=open&per_page=5`]))
     .filter((/** @type {any} */ i) => !i.pull_request);
   const openIssue = open.length ? { number: open[0].number } : null;
   const plan = planTracker(run, jobs, openIssue);
   console.log(`run ${runId}: conclusion=${run.conclusion} red-legs=${jobs.filter((j) => RED.has(String(j.conclusion))).length} open-tracker=${openIssue ? `#${openIssue.number}` : 'none'} -> ${plan.action}`);
-  if (values['dry-run'] || plan.action === 'none') {
+  if (dryRun || plan.action === 'none') {
     if (plan.body) console.log(`\n--- ${plan.title || 'comment'} ---\n${plan.body}`);
     return;
   }
   if (plan.action === 'open') {
-    gh(['label', 'create', LABEL, '--repo', repo, '--force', '--color', 'B60205',
+    runGh(['label', 'create', LABEL, '--repo', repo, '--force', '--color', 'B60205',
       '--description', 'The scheduled install/update E2E matrix is red (managed by install-e2e-red.yml)']);
-    const url = gh(['issue', 'create', '--repo', repo, '--label', LABEL, '--title', String(plan.title), '--body', String(plan.body)]);
+    const url = runGh(['issue', 'create', '--repo', repo, '--label', LABEL, '--title', String(plan.title), '--body', String(plan.body)]);
     console.log(`opened ${url.trim()}`);
   } else if (plan.action === 'update' && openIssue) {
-    gh(['api', '-X', 'PATCH', `repos/${repo}/issues/${openIssue.number}`, '-f', `title=${plan.title}`, '-f', `body=${plan.body}`]);
+    runGh(['api', '-X', 'PATCH', `repos/${repo}/issues/${openIssue.number}`, '-f', `title=${plan.title}`, '-f', `body=${plan.body}`]);
     console.log(`updated #${openIssue.number} in place`);
   } else if (plan.action === 'close' && openIssue) {
-    gh(['issue', 'comment', String(openIssue.number), '--repo', repo, '--body', String(plan.body)]);
-    gh(['issue', 'close', String(openIssue.number), '--repo', repo]);
+    runGh(['issue', 'comment', String(openIssue.number), '--repo', repo, '--body', String(plan.body)]);
+    runGh(['issue', 'close', String(openIssue.number), '--repo', repo]);
     console.log(`closed #${openIssue.number}`);
   }
 }

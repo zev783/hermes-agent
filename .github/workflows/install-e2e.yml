@@ -201,6 +201,7 @@ jobs:
           INSTALL_REF: ${{ inputs.install-ref }}
           EXCLUDE_REF: ${{ inputs.exclude-ref }}
           RELEASE_MODE: ${{ inputs.release }}
+          ALLOW_EMPTY_BASELINES: ${{ github.repository != 'NousResearch/hermes-agent' && inputs.release != true }}
         run: |
           set -euo pipefail
           [[ "$TAG_COUNT" =~ ^(10|[1-9])$ ]] || { echo "tag-count must be 1-10, got: $TAG_COUNT" >&2; exit 1; }
@@ -209,12 +210,19 @@ jobs:
             [ "$INSTALL_REF" != "$EXCLUDE_REF" ] || { echo "Candidate cannot be its own baseline" >&2; exit 1; }
             git rev-parse --verify "refs/tags/$INSTALL_REF^{commit}" >/dev/null
             tags="$(jq -cn --arg ref "$INSTALL_REF" '[$ref]')"
-          elif [ "$RELEASE_MODE" = true ]; then
-            tags="$(python3 -m scripts.releases.pick_tags --count "$TAG_COUNT" --exclude-ref "$EXCLUDE_REF")"
           else
-            tags="$(scripts/sandbox/pick-release-tags.sh --count "$TAG_COUNT")"
+            # One sampler for both SemVer and historical CalVer tags. A fork
+            # without stable releases still runs the real HEAD -> NEXT legs;
+            # official/release gates must have a released upgrade baseline.
+            options=()
+            if [ "$ALLOW_EMPTY_BASELINES" = true ]; then options+=(--allow-empty); fi
+            tags="$(python3 -m scripts.releases.pick_tags --count "$TAG_COUNT" --exclude-ref "$EXCLUDE_REF" "${options[@]}")"
           fi
           echo "Testing updates from: $tags"
+          if [ "$tags" = '[]' ]; then
+            echo '::notice::No stable releases in this fork. Testing HEAD -> NEXT; historical-release upgrade coverage is unavailable.'
+            echo 'No stable releases in this fork: HEAD -> NEXT is tested, but historical-release upgrade coverage is unavailable.' >> "$GITHUB_STEP_SUMMARY"
+          fi
           # Annotate each tag with what its own tree supports, so run
           # workflows can natively skip surfaces the starting version does
           # not have. Today: does the release ship the desktop app

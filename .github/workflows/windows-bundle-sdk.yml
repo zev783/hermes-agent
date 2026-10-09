@@ -29,7 +29,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [windows-latest-32-arm-core, windows-latest-32-arm-core]
+        runner:
+          - ${{ vars.CI_WINDOWS_X64_RUNNER || (github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-core' || 'windows-latest') }}
+          - ${{ vars.CI_WINDOWS_ARM64_RUNNER || (github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-arm-core' || 'windows-11-arm') }}
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:

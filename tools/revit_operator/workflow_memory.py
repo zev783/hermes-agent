@@ -56,7 +56,7 @@ def list_workflows(sandbox: Path) -> dict:
     workflows = []
     for path in sorted(library.glob("*.json")):
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
         except json.JSONDecodeError as exc:
             workflows.append({"path": str(path), "valid": False, "error": str(exc)})
             continue
@@ -141,7 +141,7 @@ def plan_workflow_replay(
     if not workflow_path.exists():
         return {"success": False, "error": f"Workflow template not found: {workflow_path}"}
 
-    workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
+    workflow = json.loads(workflow_path.read_text(encoding="utf-8-sig"))
     planned_steps = []
     approval_required = []
     blocked = []
@@ -213,7 +213,7 @@ def plan_workflow_approvals(
     if resolution and not resolution["success"]:
         return {"success": False, "error": resolution["error"], "requested_target": resolution["requested"]}
     target = resolution["target"] if resolution else None
-    workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
+    workflow = json.loads(workflow_path.read_text(encoding="utf-8-sig"))
     replay_plan = plan_workflow_replay(
         sandbox,
         name=name,
@@ -386,7 +386,7 @@ def replay_workflow(
         return {"success": False, "error": resolution["error"], "requested_target": resolution["requested"]}
     target = resolution["target"] if resolution else None
 
-    workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
+    workflow = json.loads(workflow_path.read_text(encoding="utf-8-sig"))
     raw_steps = workflow.get("steps") or []
     if max_steps is not None:
         raw_steps = raw_steps[: max(0, max_steps)]
@@ -602,7 +602,7 @@ def _library_dir(sandbox: Path) -> Path:
 
 def _read_journal(path: Path) -> list[dict]:
     records = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
         if not line.strip():
             continue
         try:

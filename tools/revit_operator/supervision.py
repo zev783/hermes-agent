@@ -864,7 +864,7 @@ def _load_existing_log(path) -> dict:
     if not path.exists():
         return {}
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception:
         return {}
     return payload if isinstance(payload, dict) else {}
@@ -1072,7 +1072,7 @@ def _pid_is_running(pid: int) -> bool:
             return True
         return False
     try:
-        os.kill(pid, 0)
+        os.kill(pid, 0)  # windows-footgun: ok - Windows returns from OpenProcess above
     except ProcessLookupError:
         return False
     except PermissionError:

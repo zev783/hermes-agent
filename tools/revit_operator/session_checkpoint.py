@@ -123,7 +123,7 @@ def build_agent_session_resume_plan(
             "may_call_update_goal": False,
         }
     try:
-        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as exc:
         return {
             "success": False,
@@ -340,7 +340,7 @@ def _load_optional_supervision_log(path: Path | None, sandbox: Path) -> dict:
     if not path.exists():
         return {"provided": True, "available": False, "error": f"Supervision log not found: {path}"}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as exc:
         return {"provided": True, "available": False, "error": f"Invalid supervision log JSON: {exc}"}
     if not isinstance(data, dict):

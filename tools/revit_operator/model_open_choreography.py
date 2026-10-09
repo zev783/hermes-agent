@@ -211,7 +211,7 @@ def build_model_open_prompt_approval_plan(
             "may_call_update_goal": False,
         }
     try:
-        choreography = json.loads(choreography_path.read_text(encoding="utf-8"))
+        choreography = json.loads(choreography_path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as exc:
         return {
             "success": False,
@@ -328,7 +328,7 @@ def execute_model_open_prompt_approved_step(
             "may_call_update_goal": False,
         }
     try:
-        material = json.loads(approval_material_path.read_text(encoding="utf-8"))
+        material = json.loads(approval_material_path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as exc:
         return {
             "success": False,

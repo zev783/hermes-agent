@@ -30,7 +30,7 @@ def find_views(
             or "No metadata snapshot available. Run export-metadata or qa-workflow first.",
             **source_fields,
         }
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
     matches = find_view_matches(
         metadata,
         query=query,

@@ -43,6 +43,24 @@ test('a route that selects nothing fails instead of running an empty green matri
   expect(() => generate('windows: no-such-method')).toThrow()
 })
 
+test('a fork without stable releases still exercises HEAD -> NEXT on every OS', () => {
+  const matrices: Matrices = JSON.parse(execFileSync(process.execPath, [script, '--tags', '[]'], { encoding: 'utf8' }))
+
+  for (const matrix of Object.values(matrices)) {
+    expect(matrix.include.length).toBeGreaterThan(0)
+    expect(matrix.include.every(leg => leg.name.includes('(HEAD -> NEXT)'))).toBe(true)
+  }
+})
+
+test('results survive a failed picker with no tag output', () => {
+  const report = execFileSync(process.execPath, [script, '--format', 'results', '--tags', ''], {
+    encoding: 'utf8',
+    input: JSON.stringify({ name: 'Pick release tags', conclusion: 'failure' }) + '\n',
+  })
+
+  expect(report).toContain('Install')
+})
+
 test('the pr route runs one script install updated by hermes update per OS start, nothing else', () => {
   const pr: Matrices = generate('pr')
 

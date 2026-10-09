@@ -531,7 +531,9 @@ async function main() {
   });
   if (values.format === 'results') {
     const jobs = (await readStdin()).split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
-    const annotations = /** @type {TagAnnotation[]} */ (JSON.parse(values.tags));
+    // A failed picker has no job output. Still report its failure rather than
+    // adding an unrelated JSON parse failure in this always-running reporter.
+    const annotations = /** @type {TagAnnotation[]} */ (JSON.parse(values.tags || '[]'));
     /** @type {Map<string, number>} */
     const artifactById = new Map();
     if (values.artifacts) {

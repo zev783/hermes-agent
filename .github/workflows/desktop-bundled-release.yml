@@ -201,8 +201,30 @@ env:
   RELEASE_CLAIM_OBJECT: ${{ inputs.claim-object }}
 
 jobs:
+  release-config:
+    name: Check publisher configuration
+    runs-on: ubuntu-24.04
+    environment: release-signing
+    permissions:
+      contents: read
+    outputs:
+      enabled: ${{ steps.config.outputs.enabled }}
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - id: config
+        env:
+          ENABLE_RELEASES: ${{ vars.ENABLE_RELEASES }}
+          CLOUDFLARE_R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}
+          CLOUDFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
+          CLOUDFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+          CLOUDFLARE_R2_BUCKET: ${{ vars.CLOUDFLARE_R2_BUCKET }}
+          CLOUDFLARE_R2_PUBLIC_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_URL }}
+        run: python3 -m scripts.releases.ci_policy
+
   validate:
     name: Pre-build setup
+    needs: release-config
+    if: needs.release-config.outputs.enabled == 'true'
     # One dispatch: in disposable mode the allocation steps run first (the
     # channel pin comes from them), then admission validates the build source.
     # A failed allocation fails this job and skips everything downstream.
@@ -454,7 +476,7 @@ jobs:
       matrix:
         target:
           - label: win32-x64
-            runner: windows-latest-32-core
+            runner: ${{ vars.CI_WINDOWS_X64_RUNNER || (github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-core' || 'windows-latest') }}
     env: &win32-env
       CHANNEL_BUILD: ${{ needs.validate.outputs.channel-build }}
       HERMES_DESKTOP_VARIANT: bundled
@@ -752,7 +774,7 @@ jobs:
       matrix:
         target:
           - label: win32-arm64
-            runner: windows-latest-32-arm-core
+            runner: ${{ vars.CI_WINDOWS_ARM64_RUNNER || (github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-arm-core' || 'windows-11-arm') }}
     env: *win32-env
     steps: *win32-steps
 
@@ -1475,7 +1497,7 @@ jobs:
       && (needs.validate.outputs.win32-arm64 != 'true' || needs.build-win32-arm64.result == 'success')
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && (inputs.upload_release == true || inputs.release-phase == 'candidate' || inputs.build_commit != '' || inputs.channel != '')
-    runs-on: windows-latest-32-core
+    runs-on: ${{ vars.CI_WINDOWS_X64_RUNNER || (github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-core' || 'windows-latest') }}
     environment: release-signing
     cache-mode: read
     timeout-minutes: 45
@@ -2401,7 +2423,7 @@ jobs:
     name: Verify published candidate files
     needs: validate
     if: inputs.release-phase == 'publish'
-    runs-on: ubuntu-latest-32-core
+    runs-on: ${{ vars.CI_LINUX_X64_RUNNER || (github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-32-core' || 'ubuntu-latest') }}
     environment: release-signing
     timeout-minutes: 90
     env:
@@ -2426,7 +2448,7 @@ jobs:
     name: Submit the verified Store package
     needs: [validate, stable-publish]
     if: inputs.release-phase == 'publish'
-    runs-on: windows-latest-32-core
+    runs-on: ${{ vars.CI_WINDOWS_X64_RUNNER || (github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-core' || 'windows-latest') }}
     environment: release-signing
     timeout-minutes: 60
     env:

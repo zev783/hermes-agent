@@ -79,7 +79,7 @@ def load_learned_dialog_rules(sandbox: Path) -> list[KnownDialogRule]:
     rules: list[KnownDialogRule] = []
     for path in sorted(library.glob("*.json")):
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
         except json.JSONDecodeError:
             continue
         rule = _rule_from_dict(data)
